@@ -1,0 +1,8 @@
+discord.py[voice]==2.3.2
+discord-ext-voice-recv
+python-dotenv==1.0.0
+faster-whisper==0.10.0
+python-docx==0.8.11
+reportlab==4.0.7
+openai==1.3.0
+asyncio
