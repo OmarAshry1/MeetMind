@@ -1,0 +1,11 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python MeetMind_local.py"
+healthcheckPath = "/"
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+
+[build.environment]
+NIXPACKS_PKGS = "opus libopus0 ffmpeg" 

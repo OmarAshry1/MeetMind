@@ -1,8 +1,26 @@
-discord.py[voice]==2.3.2
-discord-ext-voice-recv
-python-dotenv==1.0.0
-faster-whisper==0.10.0
-python-docx==0.8.11
-reportlab==4.0.7
-openai==1.3.0
-asyncio
+discord.py[voice]==2.6.0
+discord-ext-voice_recv==0.5.2a179
+
+# Audio processing - Updated for Railway compatibility
+PyNaCl==1.5.0
+# Remove problematic opus packages
+# opuslib==3.0.1
+# pyogg==0.6.14a1
+
+# Audio transcription
+faster-whisper==1.2.0
+ffmpeg-python==0.2.0
+
+# Document generation
+python-docx==1.2.0
+reportlab==4.4.3
+
+# OpenAI integration
+openai==1.97.1
+
+# Environment variables
+python-dotenv==1.1.1
+
+# Basic utilities
+aiohttp==3.12.15
+cffi>=1.15.0
