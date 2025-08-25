@@ -17,6 +17,7 @@ import logging
 import openai
 from openai import AsyncOpenAI
 import json
+import pickle
 
 
 logging.basicConfig(level=logging.INFO)
@@ -109,6 +110,58 @@ def get_language_display_name(language_code):
 
 active_meetings = {}
 
+def save_meetings():
+    """Save active meetings to persistent storage."""
+    try:
+        # Convert meetings to serializable format
+        serializable_meetings = {}
+        for guild_id, meeting in active_meetings.items():
+            serializable_meeting = {
+                "channel_id": meeting["channel"].id if meeting["channel"] else None,
+                "guild_id": guild_id,
+                "log": meeting["log"],
+                "start_time": meeting["start_time"],
+                "started_by": meeting["started_by"],
+                "language": meeting["language"],
+                "language_display": meeting["language_display"]
+            }
+            serializable_meetings[guild_id] = serializable_meeting
+        
+        with open("meetings.pkl", "wb") as f:
+            pickle.dump(serializable_meetings, f)
+        logger.info(f"Saved {len(serializable_meetings)} meetings to persistent storage")
+    except Exception as e:
+        logger.error(f"Error saving meetings: {e}")
+
+def load_meetings():
+    """Load meetings from persistent storage."""
+    try:
+        if os.path.exists("meetings.pkl"):
+            with open("meetings.pkl", "rb") as f:
+                saved_meetings = pickle.load(f)
+            
+            # Convert back to active format (without voice client references)
+            for guild_id, saved_meeting in saved_meetings.items():
+                # Check if meeting is still valid (within last 24 hours)
+                if (datetime.datetime.now() - saved_meeting["start_time"]).total_seconds() < 86400:
+                    active_meetings[guild_id] = {
+                        "channel": None,  # Will be restored when bot connects
+                        "log": saved_meeting["log"],
+                        "vc": None,  # Will be restored when bot connects
+                        "start_time": saved_meeting["start_time"],
+                        "started_by": saved_meeting["started_by"],
+                        "language": saved_meeting["language"],
+                        "language_display": saved_meeting["language_display"],
+                        "sink": None
+                    }
+                    logger.info(f"Restored meeting for guild {guild_id}")
+                else:
+                    logger.info(f"Meeting for guild {guild_id} expired, not restoring")
+            
+            logger.info(f"Loaded {len(active_meetings)} meetings from persistent storage")
+    except Exception as e:
+        logger.error(f"Error loading meetings: {e}")
+
 
 class TranscriptionSink(voice_recv.AudioSink):
     def __init__(self, meeting, bot_instance, language="auto"):
@@ -188,6 +241,7 @@ class TranscriptionSink(voice_recv.AudioSink):
                 speaker = user.display_name
                 
                 
+                # Add to meeting log
                 entry = {
                     'timestamp': timestamp,
                     'speaker': speaker,
@@ -196,7 +250,10 @@ class TranscriptionSink(voice_recv.AudioSink):
                 }
                 self.meeting["log"].append(entry)
                 
+                # Save meetings after adding new transcription data
+                save_meetings()
                 
+                # Send to channel
                 channel = self.meeting["channel"]
                 if channel:
                     try:
@@ -399,8 +456,72 @@ async def create_text_document(meeting_log):
 
 @bot.event
 async def on_ready():
+    """Called when the bot is ready."""
     logger.info(f'{bot.user} has connected to Discord!')
     print(f'{bot.user} has connected to Discord!')
+    
+    # Load meetings from persistent storage
+    load_meetings()
+    
+    # Restore meeting channels for active meetings
+    await restore_meeting_channels()
+    
+    print(f'Bot is ready! Logged in as {bot.user.name}')
+    print(f'Bot ID: {bot.user.id}')
+    print(f'Connected to {len(bot.guilds)} guilds')
+
+async def restore_meeting_channels():
+    """Restore meeting channels for active meetings after bot restart."""
+    for guild_id, meeting in list(active_meetings.items()):
+        try:
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                logger.warning(f"Guild {guild_id} not found, removing meeting")
+                active_meetings.pop(guild_id)
+                continue
+            
+            # Try to restore the channel
+            if meeting.get("channel_id"):
+                channel = guild.get_channel(meeting["channel_id"])
+                if channel:
+                    meeting["channel"] = channel
+                    logger.info(f"Restored channel for guild {guild_id}")
+                else:
+                    # Channel was deleted, create a new one
+                    channel_name = f"meeting-transcription-{meeting['start_time'].strftime('%m%d-%H%M')}"
+                    overwrites = {
+                        guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
+                        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+                    }
+                    
+                    try:
+                        new_channel = await guild.create_text_channel(
+                            channel_name,
+                            overwrites=overwrites,
+                            topic=f"Restored transcription channel | Language: {meeting['language_display']}"
+                        )
+                        meeting["channel"] = new_channel
+                        meeting["channel_id"] = new_channel.id
+                        logger.info(f"Created new channel for restored meeting in guild {guild_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to create new channel for guild {guild_id}: {e}")
+                        active_meetings.pop(guild_id)
+                        continue
+            
+            # Send restoration message
+            if meeting["channel"]:
+                await meeting["channel"].send(
+                    f"🔄 **Meeting Restored**\n"
+                    f"This meeting was restored after a bot restart.\n"
+                    f"Language: {meeting['language_display']}\n"
+                    f"Started: {meeting['start_time'].strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"💡 Use `!end_meeting` to generate the final transcript!\n"
+                    + "="*50
+                )
+                
+        except Exception as e:
+            logger.error(f"Error restoring meeting for guild {guild_id}: {e}")
+            active_meetings.pop(guild_id)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -529,6 +650,7 @@ async def start_meeting(ctx, *, language:str|None=None):
     }
     
     active_meetings[guild_id] = meeting
+    save_meetings() # Save meeting after it's created
     
     # Set up audio transcription with language support
     sink = TranscriptionSink(meeting, bot, language_code)
@@ -547,6 +669,7 @@ async def end_meeting(ctx, format_type="pdf"):
         return
     
     meeting = active_meetings.pop(guild_id)
+    save_meetings() # Save meeting before it's removed
     
     try:
         # Clean up the sink
@@ -675,32 +798,122 @@ async def ask_meeting_question(ctx, *, question):
             logger.error(f"Error in ask command: {e}")
             await ctx.send("❌ Sorry, I encountered an error while processing your question. Please try again.")
 
-@bot.command(name='meeting_status', aliases=['status'])
+@bot.command(name='meeting_status', aliases=['status', 'meeting_info'])
 async def meeting_status(ctx):
-    """Check the status of the current meeting."""
+    """Check current meeting status."""
     guild_id = ctx.guild.id
     
-    if guild_id not in active_meetings:
-        await ctx.send("❌ No active meeting in this server.")
+    if guild_id in active_meetings:
+        active_meeting = active_meetings[guild_id]
+        start_time = active_meeting["start_time"]
+        duration = datetime.datetime.now() - start_time
+        duration_str = str(duration).split('.')[0]  # Remove microseconds
+        
+        embed = discord.Embed(
+            title="🎙️ Active Meeting Status",
+            color=0x00ff00
+        )
+        
+        embed.add_field(
+            name="Status", 
+            value="🟢 **ACTIVE**", 
+            inline=True
+        )
+        embed.add_field(
+            name="Duration", 
+            value=f"⏱️ {duration_str}", 
+            inline=True
+        )
+        embed.add_field(
+            name="Language", 
+            value=f"🌐 {active_meeting['language_display']}", 
+            inline=True
+        )
+        embed.add_field(
+            name="Started By", 
+            value=f"👤 <@{active_meeting['started_by']}>", 
+            inline=True
+        )
+        embed.add_field(
+            name="Transcription Channel", 
+            value=f"📝 {active_meeting['channel'].mention if active_meeting['channel'] else 'Not available'}", 
+            inline=True
+        )
+        embed.add_field(
+            name="Messages Transcribed", 
+            value=f"💬 {len(active_meeting['log'])}", 
+            inline=True
+        )
+        
+        embed.set_footer(text="Use !end_meeting to finish and generate transcript")
+        
+        await ctx.send(embed=embed)
+    else:
+        embed = discord.Embed(
+            title="🎙️ Meeting Status",
+            description="No active meeting in this server.",
+            color=0xff0000
+        )
+        embed.add_field(
+            name="To start a meeting", 
+            value="• Join a voice channel\n• Use `!start_meeting [language]`\n• Examples: `!start_meeting english`, `!start_meeting arabic`", 
+            inline=False
+        )
+        await ctx.send(embed=embed)
+
+@bot.command(name='restore_meeting', aliases=['restore', 'recover_meeting'])
+async def restore_meeting(ctx):
+    """Manually restore a meeting if it was lost due to bot restart."""
+    guild_id = ctx.guild.id
+    
+    if guild_id in active_meetings:
+        await ctx.send("✅ A meeting is already active in this server.")
         return
     
-    meeting = active_meetings[guild_id]
-    duration = datetime.datetime.now() - meeting["start_time"]
-    
-    embed = discord.Embed(
-        title="🎙️ Meeting Status",
-        color=0x00ff00
-    )
-    embed.add_field(name="Duration", value=str(duration).split('.')[0], inline=True)
-    embed.add_field(name="Messages Transcribed", value=len(meeting["log"]), inline=True)
-    embed.add_field(name="Language", value=meeting.get("language_display", "Auto-detect"), inline=True)
-    embed.add_field(name="Channel", value=meeting["channel"].mention, inline=True)
-    
-    if meeting["vc"] and meeting["vc"].channel:
-        members = [m.display_name for m in meeting["vc"].channel.members if not m.bot]
-        embed.add_field(name="Participants", value=", ".join(members) or "None", inline=False)
-    
-    await ctx.send(embed=embed)
+    # Check if there's a saved meeting file
+    if os.path.exists("meetings.pkl"):
+        try:
+            with open("meetings.pkl", "rb") as f:
+                saved_meetings = pickle.load(f)
+            
+            if guild_id in saved_meetings:
+                saved_meeting = saved_meetings[guild_id]
+                
+                # Check if meeting is still valid (within last 24 hours)
+                if (datetime.datetime.now() - saved_meeting["start_time"]).total_seconds() < 86400:
+                    # Restore the meeting
+                    active_meetings[guild_id] = {
+                        "channel": None,
+                        "log": saved_meeting["log"],
+                        "vc": None,
+                        "start_time": saved_meeting["start_time"],
+                        "started_by": saved_meeting["started_by"],
+                        "language": saved_meeting["language"],
+                        "language_display": saved_meeting["language_display"],
+                        "sink": None
+                    }
+                    
+                    # Try to restore the channel
+                    guild = ctx.guild
+                    if saved_meeting.get("channel_id"):
+                        channel = guild.get_channel(saved_meeting["channel_id"])
+                        if channel:
+                            active_meetings[guild_id]["channel"] = channel
+                            await ctx.send(f"✅ Meeting restored! Channel: {channel.mention}")
+                        else:
+                            await ctx.send("⚠️ Meeting restored but original channel not found. Use `!end_meeting` to generate transcript.")
+                    else:
+                        await ctx.send("✅ Meeting restored! Use `!end_meeting` to generate transcript.")
+                    
+                    save_meetings()
+                else:
+                    await ctx.send("❌ Saved meeting has expired (older than 24 hours).")
+            else:
+                await ctx.send("❌ No saved meeting found for this server.")
+        except Exception as e:
+            await ctx.send(f"❌ Error restoring meeting: {e}")
+    else:
+        await ctx.send("❌ No saved meetings file found.")
 
 # ==== Error Handling ====
 @bot.event
@@ -746,6 +959,11 @@ async def meeting_help(ctx):
     embed.add_field(
         name="!meeting_status", 
         value="Check current meeting status", 
+        inline=False
+    )
+    embed.add_field(
+        name="!restore_meeting", 
+        value="Restore a meeting if it was lost due to bot restart", 
         inline=False
     )
     embed.add_field(
