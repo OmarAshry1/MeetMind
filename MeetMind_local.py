@@ -853,10 +853,20 @@ if __name__ == "__main__":
         print("   ✅ AI Q&A about meetings")
     else:
         print("   ❌ AI Q&A (missing OpenAI API key)")
-    print("🚀 Bot starting...")
     
-    # Start Flask server in a separate thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    print("🌐 Starting Flask healthcheck server...")
+    # Start Flask server in a separate thread (non-daemon so it stays alive)
+    flask_thread = threading.Thread(target=run_flask, daemon=False)
     flask_thread.start()
-
-    bot.run(discord_token)
+    
+    # Give Flask server a moment to start up
+    import time
+    time.sleep(2)
+    print("✅ Flask server started on port 8000")
+    
+    print("🚀 Bot starting...")
+    try:
+        bot.run(discord_token)
+    except Exception as e:
+        print(f"❌ Error starting bot: {e}")
+        exit(1)

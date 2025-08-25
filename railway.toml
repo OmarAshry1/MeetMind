@@ -2,9 +2,9 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python MeetMind_local.py"
+startCommand = "chmod +x start.sh && ./start.sh"
 healthcheckPath = "/"
-healthcheckTimeout = 300
+healthcheckTimeout = 600
 restartPolicyType = "on_failure"
 
 [build.environment]

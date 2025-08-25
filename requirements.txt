@@ -24,6 +24,9 @@ python-dotenv==1.1.1
 # Web server for healthcheck
 Flask==3.0.0
 
+# HTTP requests for testing
+requests==2.31.0
+
 # Basic utilities
 aiohttp==3.12.15
 cffi>=1.15.0
