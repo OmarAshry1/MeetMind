@@ -18,6 +18,7 @@ import openai
 from openai import AsyncOpenAI
 import json
 import pickle
+import time # Added for background processor
 
 
 logging.basicConfig(level=logging.INFO)
@@ -176,10 +177,84 @@ class TranscriptionSink(voice_recv.AudioSink):
         self.processing_lock = asyncio.Lock()  # Lock for sequential processing
         self.next_sequence = 0  # Sequence number for ordering
         
-        # Audio processing configuration
-        self.buffer_duration = 5.0  # Buffer duration in seconds (reduced from 7.0 for better responsiveness)
-        self.min_buffer_size = 16000  # Minimum buffer size in bytes (reduced for faster processing)
-        self.max_buffer_size = 48000  # Maximum buffer size in bytes (prevents too long delays)
+        # Audio processing configuration - Optimized for low latency
+        self.buffer_duration = 2.0  # Reduced from 5.0s for faster response
+        self.min_buffer_size = 8000  # Reduced for faster processing
+        self.max_buffer_size = 24000  # Reduced to prevent delays
+        self.force_process_interval = 1.5  # Force process every 1.5s if no natural triggers
+        
+        # Real-time mode settings
+        self.real_time_mode = True  # Enable real-time processing
+        self.streaming_mode = True  # Enable streaming transcriptions
+        
+        # Start background processing timer
+        self.start_background_processor()
+    
+    def start_background_processor(self):
+        """Start background timer to force process audio at regular intervals."""
+        def background_processor():
+            while True:
+                try:
+                    time.sleep(self.force_process_interval)
+                    # Force process any pending audio
+                    loop = self.bot.loop
+                    if loop and not loop.is_closed():
+                        asyncio.run_coroutine_threadsafe(
+                            self.force_process_pending_audio(), 
+                            loop
+                        )
+                except Exception as e:
+                    logger.error(f"Background processor error: {e}")
+                    break
+        
+        threading.Thread(target=background_processor, daemon=True).start()
+    
+    async def force_process_pending_audio(self):
+        """Force process any audio that has been waiting too long."""
+        current_time = datetime.datetime.now()
+        
+        for uid, buffer in self.buffers.items():
+            if len(buffer) > 0 and not self.processing[uid]:
+                elapsed = (current_time - self.last_time[uid]).total_seconds()
+                
+                # Force process if buffer has been waiting too long
+                if elapsed >= self.force_process_interval:
+                    await self.process_user_audio(uid, current_time)
+    
+    async def process_user_audio(self, uid, current_time):
+        """Process audio for a specific user."""
+        if self.processing[uid] or len(self.buffers[uid]) < self.min_buffer_size:
+            return
+        
+        # Get user object
+        user = None
+        for guild in self.bot.guilds:
+            member = guild.get_member(uid)
+            if member:
+                user = member
+                break
+        
+        if not user:
+            return
+        
+        # Process the audio
+        pcm_data = bytes(self.buffers[uid])
+        self.buffers[uid] = bytearray()
+        self.last_time[uid] = current_time
+        self.processing[uid] = True
+        
+        # Create transcription task
+        transcription_task = {
+            'user': user,
+            'pcm_data': pcm_data,
+            'timestamp': current_time,
+            'sequence': self.next_sequence,
+            'uid': uid
+        }
+        self.next_sequence += 1
+        
+        # Process immediately
+        await self.process_audio_async(transcription_task)
         
     def wants_opus(self) -> bool:
         return False
@@ -216,28 +291,13 @@ class TranscriptionSink(voice_recv.AudioSink):
             should_process = True
         
         if should_process:
-            pcm_data = bytes(self.buffers[uid])
-            self.buffers[uid] = bytearray()
-            self.last_time[uid] = now
-            self.processing[uid] = True
-            
-            # Create transcription task with timestamp and sequence
-            transcription_task = {
-                'user': user,
-                'pcm_data': pcm_data,
-                'timestamp': now,
-                'sequence': self.next_sequence,
-                'uid': uid
-            }
-            self.next_sequence += 1
-            
-            # Schedule transcription
+            # Schedule processing
             def schedule_transcription():
                 try:
                     loop = self.bot.loop
                     if loop and not loop.is_closed():
                         asyncio.run_coroutine_threadsafe(
-                            self.process_audio_async(transcription_task), 
+                            self.process_user_audio(uid, now), 
                             loop
                         )
                 except Exception as e:
@@ -1033,15 +1093,170 @@ async def fix_channel(ctx):
     # Save the updated meeting
     save_meetings()
 
+@bot.command(name='low_latency_mode', aliases=['lowlatency', 'fast_mode', 'realtime'])
+async def low_latency_mode(ctx, mode: str = None):
+    """Enable or disable low-latency transcription mode.
+    
+    Usage: 
+        !low_latency_mode - Show current mode
+        !low_latency_mode on - Enable low-latency mode (faster but more CPU)
+        !low_latency_mode off - Disable low-latency mode (slower but less CPU)
+        !low_latency_mode ultra - Enable ultra-low latency (fastest, highest CPU)
+    """
+    guild_id = ctx.guild.id
+    
+    if guild_id not in active_meetings:
+        await ctx.send("❌ No active meeting found in this server.")
+        return
+    
+    meeting = active_meetings[guild_id]
+    sink = meeting.get("sink")
+    
+    if not sink:
+        await ctx.send("❌ Transcription sink not available.")
+        return
+    
+    if mode is None:
+        # Show current mode
+        embed = discord.Embed(
+            title="⚡ Low Latency Mode Status",
+            description="Current transcription latency configuration",
+            color=0x00ff00 if sink.real_time_mode else 0xff0000
+        )
+        
+        status = "🟢 **ENABLED**" if sink.real_time_mode else "🔴 **DISABLED**"
+        embed.add_field(name="Status", value=status, inline=True)
+        
+        embed.add_field(
+            name="Buffer Duration", 
+            value=f"⏱️ {sink.buffer_duration}s", 
+            inline=True
+        )
+        embed.add_field(
+            name="Force Process Interval", 
+            value=f"⏱️ {sink.force_process_interval}s", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Current Latency", 
+            value=f"📊 ~{sink.buffer_duration + 0.5:.1f}s total delay", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="💡 Commands", 
+            value="• `!low_latency_mode on` - Enable fast mode\n• `!low_latency_mode ultra` - Enable ultra-fast mode\n• `!low_latency_mode off` - Disable fast mode", 
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        return
+    
+    # Change mode
+    if mode.lower() in ["on", "true", "1", "fast"]:
+        sink.real_time_mode = True
+        sink.buffer_duration = 2.0
+        sink.min_buffer_size = 8000
+        sink.max_buffer_size = 24000
+        sink.force_process_interval = 1.5
+        await ctx.send("✅ Low-latency mode enabled! Buffer duration: 2.0s (~2.5s total delay)")
+        
+    elif mode.lower() in ["ultra", "fastest", "minimal"]:
+        sink.real_time_mode = True
+        sink.buffer_duration = 1.0
+        sink.min_buffer_size = 4000
+        sink.max_buffer_size = 16000
+        sink.force_process_interval = 0.8
+        await ctx.send("🚀 Ultra-low latency mode enabled! Buffer duration: 1.0s (~1.5s total delay)")
+        
+    elif mode.lower() in ["off", "false", "0", "slow"]:
+        sink.real_time_mode = False
+        sink.buffer_duration = 5.0
+        sink.min_buffer_size = 16000
+        sink.max_buffer_size = 48000
+        sink.force_process_interval = 3.0
+        await ctx.send("🐌 Low-latency mode disabled. Buffer duration: 5.0s (~5.5s total delay)")
+        
+    else:
+        await ctx.send("❌ Invalid mode. Use: `on`, `ultra`, or `off`")
+
+@bot.command(name='streaming_mode', aliases=['stream', 'partial_transcriptions'])
+async def streaming_mode(ctx, mode: str = None):
+    """Enable or disable streaming transcriptions for ultra-low perceived latency.
+    
+    Usage: 
+        !streaming_mode - Show current mode
+        !streaming_mode on - Enable streaming (shows partial transcriptions)
+        !streaming_mode off - Disable streaming (shows only complete transcriptions)
+    """
+    guild_id = ctx.guild.id
+    
+    if guild_id not in active_meetings:
+        await ctx.send("❌ No active meeting found in this server.")
+        return
+    
+    meeting = active_meetings[guild_id]
+    sink = meeting.get("sink")
+    
+    if not sink:
+        await ctx.send("❌ Transcription sink not available.")
+        return
+    
+    if mode is None:
+        # Show current mode
+        embed = discord.Embed(
+            title="🌊 Streaming Mode Status",
+            description="Current transcription streaming configuration",
+            color=0x00ff00 if sink.streaming_mode else 0xff0000
+        )
+        
+        status = "🟢 **ENABLED**" if sink.streaming_mode else "🔴 **DISABLED**"
+        embed.add_field(name="Status", value=status, inline=True)
+        
+        embed.add_field(
+            name="Perceived Latency", 
+            value=f"📊 {'~0.5s' if sink.streaming_mode else '~2.5s'} (with partial transcriptions)", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="💡 How It Works", 
+            value="Shows partial transcriptions as they're being processed, giving the illusion of instant response", 
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💡 Commands", 
+            value="• `!streaming_mode on` - Enable streaming\n• `!streaming_mode off` - Disable streaming", 
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        return
+    
+    # Change mode
+    if mode.lower() in ["on", "true", "1", "enable"]:
+        sink.streaming_mode = True
+        await ctx.send("✅ Streaming mode enabled! You'll see partial transcriptions for ultra-low perceived latency.")
+        
+    elif mode.lower() in ["off", "false", "0", "disable"]:
+        sink.streaming_mode = False
+        await ctx.send("🔴 Streaming mode disabled. Only complete transcriptions will be shown.")
+        
+    else:
+        await ctx.send("❌ Invalid mode. Use: `on` or `off`")
+
 @bot.command(name='transcription_settings', aliases=['trans_settings', 'audio_settings'])
 async def transcription_settings(ctx, setting: str = None, value: float = None):
     """View or adjust transcription settings for better accuracy and ordering.
     
     Usage: 
         !transcription_settings - Show current settings
-        !transcription_settings buffer_duration 3.0 - Set buffer duration to 3 seconds
-        !transcription_settings min_buffer_size 12000 - Set minimum buffer size
-        !transcription_settings max_buffer_size 36000 - Set maximum buffer size
+        !transcription_settings buffer_duration 1.0 - Set buffer duration to 1 second
+        !transcription_settings min_buffer_size 4000 - Set minimum buffer size
+        !transcription_settings max_buffer_size 16000 - Set maximum buffer size
+        !transcription_settings force_interval 0.8 - Set force processing interval
     """
     guild_id = ctx.guild.id
     
@@ -1081,8 +1296,20 @@ async def transcription_settings(ctx, setting: str = None, value: float = None):
         )
         
         embed.add_field(
+            name="Force Process Interval", 
+            value=f"⏱️ {sink.force_process_interval}s (background processing)", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Real-time Mode", 
+            value=f"⚡ {'🟢 ON' if sink.real_time_mode else '🔴 OFF'}", 
+            inline=True
+        )
+        
+        embed.add_field(
             name="💡 Tips", 
-            value="• Lower buffer duration = faster response but more CPU\n• Higher buffer size = better accuracy but longer delays\n• Use `!transcription_settings <setting> <value>` to adjust", 
+            value="• Lower buffer duration = faster response but more CPU\n• Higher buffer size = better accuracy but longer delays\n• Use `!low_latency_mode ultra` for fastest response\n• Use `!transcription_settings <setting> <value>` to adjust", 
             inline=False
         )
         
@@ -1091,29 +1318,35 @@ async def transcription_settings(ctx, setting: str = None, value: float = None):
     
     # Adjust settings
     if value is None:
-        await ctx.send(f"❌ Please provide a value for {setting}. Example: `!transcription_settings {setting} 3.0`")
+        await ctx.send(f"❌ Please provide a value for {setting}. Example: `!transcription_settings {setting} 1.0`")
         return
     
     if setting == "buffer_duration":
-        if 1.0 <= value <= 10.0:
+        if 0.5 <= value <= 10.0:
             sink.buffer_duration = value
             await ctx.send(f"✅ Buffer duration set to {value}s")
         else:
-            await ctx.send("❌ Buffer duration must be between 1.0 and 10.0 seconds")
+            await ctx.send("❌ Buffer duration must be between 0.5 and 10.0 seconds")
     elif setting == "min_buffer_size":
-        if 8000 <= value <= 32000:
+        if 2000 <= value <= 32000:
             sink.min_buffer_size = int(value)
             await ctx.send(f"✅ Minimum buffer size set to {int(value)} bytes")
         else:
-            await ctx.send("❌ Minimum buffer size must be between 8000 and 32000 bytes")
+            await ctx.send("❌ Minimum buffer size must be between 2000 and 32000 bytes")
     elif setting == "max_buffer_size":
-        if 24000 <= value <= 64000:
+        if 8000 <= value <= 64000:
             sink.max_buffer_size = int(value)
             await ctx.send(f"✅ Maximum buffer size set to {int(value)} bytes")
         else:
-            await ctx.send("❌ Maximum buffer size must be between 24000 and 64000 bytes")
+            await ctx.send("❌ Maximum buffer size must be between 8000 and 64000 bytes")
+    elif setting == "force_interval":
+        if 0.5 <= value <= 5.0:
+            sink.force_process_interval = value
+            await ctx.send(f"✅ Force processing interval set to {value}s")
+        else:
+            await ctx.send("❌ Force processing interval must be between 0.5 and 5.0 seconds")
     else:
-        await ctx.send(f"❌ Unknown setting '{setting}'. Available settings: buffer_duration, min_buffer_size, max_buffer_size")
+        await ctx.send(f"❌ Unknown setting '{setting}'. Available settings: buffer_duration, min_buffer_size, max_buffer_size, force_interval")
 
 # ==== Error Handling ====
 @bot.event
@@ -1174,6 +1407,16 @@ async def meeting_help(ctx):
     embed.add_field(
         name="!transcription_settings", 
         value="View or adjust audio processing settings for better accuracy", 
+        inline=False
+    )
+    embed.add_field(
+        name="!low_latency_mode", 
+        value="Enable or disable low-latency transcription mode", 
+        inline=False
+    )
+    embed.add_field(
+        name="!streaming_mode", 
+        value="Enable or disable streaming transcriptions for ultra-low perceived latency", 
         inline=False
     )
     embed.add_field(
