@@ -568,6 +568,8 @@ async def auto_end_meeting(guild_id):
                     os.remove(filename)
                 except Exception as e:
                     logger.error(f"Error sending auto-generated transcript: {e}")
+            else:
+                logger.warning(f"Meeting channel not available for guild {guild_id}, cannot send auto-generated transcript")
         
     except Exception as e:
         logger.error(f"Error in auto_end_meeting: {e}")
@@ -688,8 +690,13 @@ async def end_meeting(ctx, format_type="pdf"):
             
             filename = await create_transcript_document(meeting["log"], format_type.lower())
             
-            # Send transcript to the channel
+            # Send transcript to the channel - use fallback if meeting channel is not available
             channel = meeting["channel"]
+            if not channel:
+                # If meeting channel is not available (e.g., after bot restart), use the command channel
+                channel = ctx.channel
+                logger.info(f"Meeting channel not available, using command channel {ctx.channel.name} for transcript")
+            
             duration = datetime.datetime.now() - meeting["start_time"]
             
             embed = discord.Embed(
@@ -709,6 +716,12 @@ async def end_meeting(ctx, format_type="pdf"):
                 os.remove(filename)
                 await ctx.send("✅ Meeting ended successfully! Transcript has been generated.")
                 
+            except discord.Forbidden:
+                logger.error(f"Bot lacks permission to send files in channel {channel.name}")
+                await ctx.send("❌ Bot lacks permission to send files in the transcription channel. Please check bot permissions.")
+            except discord.HTTPException as e:
+                logger.error(f"HTTP error sending transcript file: {e}")
+                await ctx.send(f"❌ Error sending transcript file: {e}")
             except Exception as e:
                 logger.error(f"Error sending transcript file: {e}")
                 await ctx.send("✅ Meeting ended, but there was an error sending the transcript file.")
@@ -899,9 +912,28 @@ async def restore_meeting(ctx):
                         channel = guild.get_channel(saved_meeting["channel_id"])
                         if channel:
                             active_meetings[guild_id]["channel"] = channel
+                            active_meetings[guild_id]["channel_id"] = channel.id
                             await ctx.send(f"✅ Meeting restored! Channel: {channel.mention}")
                         else:
-                            await ctx.send("⚠️ Meeting restored but original channel not found. Use `!end_meeting` to generate transcript.")
+                            # Channel was deleted, create a new one
+                            channel_name = f"meeting-transcription-{saved_meeting['start_time'].strftime('%m%d-%H%M')}"
+                            overwrites = {
+                                guild.default_role: discord.PermissionOverwrite(read_messages=True, send_messages=False),
+                                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+                            }
+                            
+                            try:
+                                new_channel = await guild.create_text_channel(
+                                    channel_name,
+                                    overwrites=overwrites,
+                                    topic=f"Restored transcription channel | Language: {saved_meeting['language_display']}"
+                                )
+                                active_meetings[guild_id]["channel"] = new_channel
+                                active_meetings[guild_id]["channel_id"] = new_channel.id
+                                await ctx.send(f"✅ Meeting restored! New channel created: {new_channel.mention}")
+                            except Exception as e:
+                                logger.error(f"Failed to create new channel for guild {guild_id}: {e}")
+                                await ctx.send("⚠️ Meeting restored but failed to create new channel. Use `!end_meeting` in any channel to generate transcript.")
                     else:
                         await ctx.send("✅ Meeting restored! Use `!end_meeting` to generate transcript.")
                     
@@ -914,6 +946,33 @@ async def restore_meeting(ctx):
             await ctx.send(f"❌ Error restoring meeting: {e}")
     else:
         await ctx.send("❌ No saved meetings file found.")
+
+@bot.command(name='fix_channel', aliases=['fix_ch', 'repair_channel'])
+async def fix_channel(ctx):
+    """Fix channel reference for the current meeting if it's broken."""
+    guild_id = ctx.guild.id
+    
+    if guild_id not in active_meetings:
+        await ctx.send("❌ No active meeting found in this server.")
+        return
+    
+    meeting = active_meetings[guild_id]
+    
+    if meeting["channel"] and meeting["channel"].id == ctx.channel.id:
+        await ctx.send("✅ Channel reference is already correct for this meeting.")
+        return
+    
+    # Update the channel reference to the current channel
+    meeting["channel"] = ctx.channel
+    meeting["channel_id"] = ctx.channel.id
+    
+    await ctx.send(
+        f"✅ Channel reference fixed! This channel ({ctx.channel.mention}) is now the transcription channel.\n"
+        f"💡 You can now use `!end_meeting` to generate the transcript."
+    )
+    
+    # Save the updated meeting
+    save_meetings()
 
 # ==== Error Handling ====
 @bot.event
@@ -964,6 +1023,11 @@ async def meeting_help(ctx):
     embed.add_field(
         name="!restore_meeting", 
         value="Restore a meeting if it was lost due to bot restart", 
+        inline=False
+    )
+    embed.add_field(
+        name="!fix_channel", 
+        value="Fix channel reference for current meeting if broken", 
         inline=False
     )
     embed.add_field(
