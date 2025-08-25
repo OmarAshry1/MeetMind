@@ -363,27 +363,27 @@ class TranscriptionSink(voice_recv.AudioSink):
             text = transcription['text']
             
             # Add to meeting log
-                entry = {
-                    'timestamp': timestamp,
-                    'speaker': speaker,
+            entry = {
+                'timestamp': timestamp,
+                'speaker': speaker,
                 'text': text,
                 'user_id': transcription['user_id']
-                }
-                self.meeting["log"].append(entry)
-                
+            }
+            self.meeting["log"].append(entry)
+            
             # Save meetings after adding new transcription data
             save_meetings()
-                
+            
             # Send to channel
-                channel = self.meeting["channel"]
-                if channel:
-                    try:
+            channel = self.meeting["channel"]
+            if channel:
+                try:
                     await channel.send(f"[{timestamp}] **{speaker}**: {text}")
-                    except discord.errors.NotFound:
-                        logger.warning("Text channel not found, meeting may have ended")
-                    except Exception as e:
-                        logger.error(f"Error sending message to channel: {e}")
-                        
+                except discord.errors.NotFound:
+                    logger.warning("Text channel not found, meeting may have ended")
+                except Exception as e:
+                    logger.error(f"Error sending message to channel: {e}")
+            
             # Small delay to ensure proper ordering in Discord
             await asyncio.sleep(0.1)
     
@@ -1118,7 +1118,7 @@ async def low_latency_mode(ctx, mode: str = None):
     
     if mode is None:
         # Show current mode
-    embed = discord.Embed(
+        embed = discord.Embed(
             title="⚡ Low Latency Mode Status",
             description="Current transcription latency configuration",
             color=0x00ff00 if sink.real_time_mode else 0xff0000
@@ -1149,8 +1149,8 @@ async def low_latency_mode(ctx, mode: str = None):
             value="• `!low_latency_mode on` - Enable fast mode\n• `!low_latency_mode ultra` - Enable ultra-fast mode\n• `!low_latency_mode off` - Disable fast mode", 
             inline=False
         )
-    
-    await ctx.send(embed=embed)
+        
+        await ctx.send(embed=embed)
         return
     
     # Change mode
@@ -1494,7 +1494,7 @@ if __name__ == "__main__":
     
     print("🚀 Bot starting...")
     try:
-    bot.run(discord_token)
+        bot.run(discord_token)
     except Exception as e:
         print(f"❌ Error starting bot: {e}")
         exit(1)
