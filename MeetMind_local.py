@@ -172,6 +172,14 @@ class TranscriptionSink(voice_recv.AudioSink):
         self.buffers = defaultdict(bytearray)
         self.last_time = defaultdict(lambda: datetime.datetime.now())
         self.processing = defaultdict(bool)
+        self.pending_transcriptions = []  # Queue for pending transcriptions
+        self.processing_lock = asyncio.Lock()  # Lock for sequential processing
+        self.next_sequence = 0  # Sequence number for ordering
+        
+        # Audio processing configuration
+        self.buffer_duration = 5.0  # Buffer duration in seconds (reduced from 7.0 for better responsiveness)
+        self.min_buffer_size = 16000  # Minimum buffer size in bytes (reduced for faster processing)
+        self.max_buffer_size = 48000  # Maximum buffer size in bytes (prevents too long delays)
         
     def wants_opus(self) -> bool:
         return False
@@ -180,6 +188,7 @@ class TranscriptionSink(voice_recv.AudioSink):
         self.buffers.clear()
         self.last_time.clear()
         self.processing.clear()
+        self.pending_transcriptions.clear()
     
     def write(self, user, data: voice_recv.VoiceData):
         """Called by voice_recv when audio arrives (must be sync)."""
@@ -188,41 +197,65 @@ class TranscriptionSink(voice_recv.AudioSink):
             
         uid = user.id
         
-        
+        # Add audio to user's buffer
         self.buffers[uid].extend(data.pcm)
         
         now = datetime.datetime.now()
         elapsed = (now - self.last_time[uid]).total_seconds()
+        current_buffer_size = len(self.buffers[uid])
         
-       
-        if elapsed >= 7.0 and len(self.buffers[uid]) > 22400 and not self.processing[uid]:  # Increased minimum buffer size for better accuracy
+        # Process audio when buffer is ready (time-based or size-based)
+        should_process = (
+            elapsed >= self.buffer_duration and 
+            current_buffer_size >= self.min_buffer_size and 
+            not self.processing[uid]
+        )
+        
+        # Force processing if buffer gets too large (prevents long delays)
+        if current_buffer_size >= self.max_buffer_size and not self.processing[uid]:
+            should_process = True
+        
+        if should_process:
             pcm_data = bytes(self.buffers[uid])
             self.buffers[uid] = bytearray()
             self.last_time[uid] = now
             self.processing[uid] = True
             
+            # Create transcription task with timestamp and sequence
+            transcription_task = {
+                'user': user,
+                'pcm_data': pcm_data,
+                'timestamp': now,
+                'sequence': self.next_sequence,
+                'uid': uid
+            }
+            self.next_sequence += 1
             
+            # Schedule transcription
             def schedule_transcription():
                 try:
-                    # Get the bot's event loop
                     loop = self.bot.loop
                     if loop and not loop.is_closed():
                         asyncio.run_coroutine_threadsafe(
-                            self.process_audio_async(user, pcm_data), 
+                            self.process_audio_async(transcription_task), 
                             loop
                         )
                 except Exception as e:
                     logger.error(f"Error scheduling transcription: {e}")
                     self.processing[uid] = False
             
-            
             threading.Thread(target=schedule_transcription, daemon=True).start()
     
-    async def process_audio_async(self, user, pcm_data):
-        """Process audio data asynchronously."""
-        uid = user.id
+    async def process_audio_async(self, transcription_task):
+        """Process audio data asynchronously with proper ordering."""
+        user = transcription_task['user']
+        pcm_data = transcription_task['pcm_data']
+        uid = transcription_task['uid']
+        timestamp = transcription_task['timestamp']
+        sequence = transcription_task['sequence']
+        
         try:
-            
+            # Convert audio to WAV format
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, 'wb') as wav_file:
                 wav_file.setnchannels(2)  # Stereo
@@ -232,41 +265,67 @@ class TranscriptionSink(voice_recv.AudioSink):
             
             wav_buffer.seek(0)
             
-          
+            # Transcribe audio
             loop = asyncio.get_event_loop()
             text = await loop.run_in_executor(None, self.transcribe_audio, wav_buffer)
             
             if text and text.strip():
-                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-                speaker = user.display_name
-                
-                
-                # Add to meeting log
-                entry = {
-                    'timestamp': timestamp,
-                    'speaker': speaker,
-                    'text': text.strip(),
-                    'user_id': uid
-                }
-                self.meeting["log"].append(entry)
-                
-                # Save meetings after adding new transcription data
-                save_meetings()
-                
-                # Send to channel
-                channel = self.meeting["channel"]
-                if channel:
-                    try:
-                        await channel.send(f"[{timestamp}] **{speaker}**: {text.strip()}")
-                    except discord.errors.NotFound:
-                        logger.warning("Text channel not found, meeting may have ended")
-                    except Exception as e:
-                        logger.error(f"Error sending message to channel: {e}")
-                        
+                # Add to pending transcriptions queue
+                async with self.processing_lock:
+                    self.pending_transcriptions.append({
+                        'timestamp': timestamp,
+                        'sequence': sequence,
+                        'speaker': user.display_name,
+                        'text': text.strip(),
+                        'user_id': uid
+                    })
+                    
+                    # Sort by timestamp and sequence to maintain order
+                    self.pending_transcriptions.sort(key=lambda x: (x['timestamp'], x['sequence']))
+                    
+                    # Process all pending transcriptions in order
+                    await self.process_pending_transcriptions()
+                    
         except Exception as e:
             logger.error(f"Error processing audio for user {user.display_name}: {e}")
         finally:
             self.processing[uid] = False
+    
+    async def process_pending_transcriptions(self):
+        """Process all pending transcriptions in chronological order."""
+        while self.pending_transcriptions:
+            # Get the next transcription in order
+            transcription = self.pending_transcriptions.pop(0)
+            
+            # Format timestamp
+            timestamp = transcription['timestamp'].strftime("%H:%M:%S")
+            speaker = transcription['speaker']
+            text = transcription['text']
+            
+            # Add to meeting log
+            entry = {
+                'timestamp': timestamp,
+                'speaker': speaker,
+                'text': text,
+                'user_id': transcription['user_id']
+            }
+            self.meeting["log"].append(entry)
+            
+            # Save meetings after adding new transcription data
+            save_meetings()
+            
+            # Send to channel
+            channel = self.meeting["channel"]
+            if channel:
+                try:
+                    await channel.send(f"[{timestamp}] **{speaker}**: {text}")
+                except discord.errors.NotFound:
+                    logger.warning("Text channel not found, meeting may have ended")
+                except Exception as e:
+                    logger.error(f"Error sending message to channel: {e}")
+            
+            # Small delay to ensure proper ordering in Discord
+            await asyncio.sleep(0.1)
     
     def transcribe_audio(self, wav_buffer):
         """Transcribe audio using Whisper model with language support."""
@@ -974,6 +1033,88 @@ async def fix_channel(ctx):
     # Save the updated meeting
     save_meetings()
 
+@bot.command(name='transcription_settings', aliases=['trans_settings', 'audio_settings'])
+async def transcription_settings(ctx, setting: str = None, value: float = None):
+    """View or adjust transcription settings for better accuracy and ordering.
+    
+    Usage: 
+        !transcription_settings - Show current settings
+        !transcription_settings buffer_duration 3.0 - Set buffer duration to 3 seconds
+        !transcription_settings min_buffer_size 12000 - Set minimum buffer size
+        !transcription_settings max_buffer_size 36000 - Set maximum buffer size
+    """
+    guild_id = ctx.guild.id
+    
+    if guild_id not in active_meetings:
+        await ctx.send("❌ No active meeting found in this server.")
+        return
+    
+    meeting = active_meetings[guild_id]
+    sink = meeting.get("sink")
+    
+    if not sink:
+        await ctx.send("❌ Transcription sink not available.")
+        return
+    
+    if setting is None:
+        # Show current settings
+        embed = discord.Embed(
+            title="🎙️ Transcription Settings",
+            description="Current audio processing configuration",
+            color=0x0099ff
+        )
+        
+        embed.add_field(
+            name="Buffer Duration", 
+            value=f"⏱️ {sink.buffer_duration}s (time before processing audio)", 
+            inline=True
+        )
+        embed.add_field(
+            name="Min Buffer Size", 
+            value=f"📊 {sink.min_buffer_size} bytes (minimum audio before processing)", 
+            inline=True
+        )
+        embed.add_field(
+            name="Max Buffer Size", 
+            value=f"📊 {sink.max_buffer_size} bytes (force processing if exceeded)", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="💡 Tips", 
+            value="• Lower buffer duration = faster response but more CPU\n• Higher buffer size = better accuracy but longer delays\n• Use `!transcription_settings <setting> <value>` to adjust", 
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        return
+    
+    # Adjust settings
+    if value is None:
+        await ctx.send(f"❌ Please provide a value for {setting}. Example: `!transcription_settings {setting} 3.0`")
+        return
+    
+    if setting == "buffer_duration":
+        if 1.0 <= value <= 10.0:
+            sink.buffer_duration = value
+            await ctx.send(f"✅ Buffer duration set to {value}s")
+        else:
+            await ctx.send("❌ Buffer duration must be between 1.0 and 10.0 seconds")
+    elif setting == "min_buffer_size":
+        if 8000 <= value <= 32000:
+            sink.min_buffer_size = int(value)
+            await ctx.send(f"✅ Minimum buffer size set to {int(value)} bytes")
+        else:
+            await ctx.send("❌ Minimum buffer size must be between 8000 and 32000 bytes")
+    elif setting == "max_buffer_size":
+        if 24000 <= value <= 64000:
+            sink.max_buffer_size = int(value)
+            await ctx.send(f"✅ Maximum buffer size set to {int(value)} bytes")
+        else:
+            await ctx.send("❌ Maximum buffer size must be between 24000 and 64000 bytes")
+    else:
+        await ctx.send(f"❌ Unknown setting '{setting}'. Available settings: buffer_duration, min_buffer_size, max_buffer_size")
+
 # ==== Error Handling ====
 @bot.event
 async def on_command_error(ctx, error):
@@ -1028,6 +1169,11 @@ async def meeting_help(ctx):
     embed.add_field(
         name="!fix_channel", 
         value="Fix channel reference for current meeting if broken", 
+        inline=False
+    )
+    embed.add_field(
+        name="!transcription_settings", 
+        value="View or adjust audio processing settings for better accuracy", 
         inline=False
     )
     embed.add_field(
