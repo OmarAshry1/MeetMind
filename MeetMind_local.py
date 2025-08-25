@@ -374,18 +374,11 @@ class TranscriptionSink(voice_recv.AudioSink):
             # Save meetings after adding new transcription data
             save_meetings()
             
-            # Send to channel as an embed widget
+            # Send to channel
             channel = self.meeting["channel"]
             if channel:
                 try:
-                    embed = discord.Embed(
-                        title="🗣️ New Transcription",
-                        color=0x2ECC71
-                    )
-                    embed.add_field(name="Speaker", value=speaker, inline=True)
-                    embed.add_field(name="Time", value=timestamp, inline=True)
-                    embed.add_field(name="Content", value=text, inline=False)
-                    await channel.send(embed=embed)
+                    await channel.send(f"[{timestamp}] **{speaker}**: {text}")
                 except discord.errors.NotFound:
                     logger.warning("Text channel not found, meeting may have ended")
                 except Exception as e:
@@ -651,68 +644,17 @@ async def restore_meeting_channels():
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Track joins/leaves for active meetings and auto-end when empty."""
-    try:
-        for guild_id, meeting in list(active_meetings.items()):
-            vc = meeting.get("vc")
-            if not vc or not vc.channel:
-                continue
+    """Handle voice state changes to clean up meetings when everyone leaves."""
+    
+    for guild_id, meeting in list(active_meetings.items()):
+        if meeting["vc"] and meeting["vc"].channel:
+           
+            members_in_channel = [m for m in meeting["vc"].channel.members if not m.bot]
             
-            meeting_channel = vc.channel
-            channel_obj = meeting.get("channel")
-            participants: set = meeting.setdefault("participants", set())
-            now_ts = datetime.datetime.now().strftime("%H:%M:%S")
             
-            # User joins the meeting voice channel
-            if after and after.channel == meeting_channel and (before is None or before.channel != meeting_channel):
-                if not member.bot and member.id not in participants:
-                    participants.add(member.id)
-                    # Log and notify without blocking audio
-                    join_text = f"{member.display_name} joined meeting"
-                    meeting["log"].append({
-                        'timestamp': now_ts,
-                        'speaker': 'System',
-                        'text': join_text,
-                        'user_id': member.id
-                    })
-                    save_meetings()
-                    if channel_obj:
-                        try:
-                            embed = discord.Embed(title="➕ Participant Joined", color=0x2ECC71)
-                            embed.add_field(name="User", value=member.display_name, inline=True)
-                            embed.add_field(name="Time", value=now_ts, inline=True)
-                            await channel_obj.send(embed=embed)
-                        except Exception as e:
-                            logger.warning(f"Failed to send join embed: {e}")
-            
-            # User leaves the meeting voice channel
-            if before and before.channel == meeting_channel and (after is None or after.channel != meeting_channel):
-                if not member.bot and member.id in participants:
-                    participants.discard(member.id)
-                    leave_text = f"{member.display_name} left meeting"
-                    meeting["log"].append({
-                        'timestamp': now_ts,
-                        'speaker': 'System',
-                        'text': leave_text,
-                        'user_id': member.id
-                    })
-                    save_meetings()
-                    if channel_obj:
-                        try:
-                            embed = discord.Embed(title="➖ Participant Left", color=0xE74C3C)
-                            embed.add_field(name="User", value=member.display_name, inline=True)
-                            embed.add_field(name="Time", value=now_ts, inline=True)
-                            await channel_obj.send(embed=embed)
-                        except Exception as e:
-                            logger.warning(f"Failed to send leave embed: {e}")
-            
-            # Auto-end when everyone leaves (existing logic)
-            members_in_channel = [m for m in meeting_channel.members if not m.bot]
             if len(members_in_channel) == 0:
                 logger.info(f"Auto-ending meeting in guild {guild_id} - no members left")
                 await auto_end_meeting(guild_id)
-    except Exception as e:
-        logger.error(f"on_voice_state_update error: {e}")
 
 async def auto_end_meeting(guild_id):
     """Automatically end a meeting when all participants leave."""
@@ -817,11 +759,6 @@ async def start_meeting(ctx, *, language:str|None=None):
         await ctx.send(f"❌ Failed to connect to voice channel: {e}")
         return
     
-    # Build initial participants list (non-bot)
-    initial_members = [m for m in vc_channel.members if not m.bot]
-    participant_ids = {m.id for m in initial_members}
-    participant_names = ", ".join(m.display_name for m in initial_members) or "None"
-    
     # Create meeting record
     meeting = {
         "channel": text_channel,
@@ -830,27 +767,16 @@ async def start_meeting(ctx, *, language:str|None=None):
         "start_time": datetime.datetime.now(),
         "started_by": ctx.author.id,
         "language": language_code,
-        "language_display": language_display,
-        "participants": participant_ids
+        "language_display": language_display
     }
     
     active_meetings[guild_id] = meeting
-    save_meetings()
+    save_meetings() # Save meeting after it's created
     
     # Set up audio transcription with language support
     sink = TranscriptionSink(meeting, bot, language_code)
     meeting["sink"] = sink  # Store reference for cleanup
     voice_client.listen(sink)
-    
-    # Send initial participants as an embed widget
-    try:
-        embed = discord.Embed(title="👥 Participants at Start", color=0x3498DB)
-        embed.add_field(name="Count", value=str(len(participant_ids)), inline=True)
-        embed.add_field(name="Time", value=datetime.datetime.now().strftime("%H:%M:%S"), inline=True)
-        embed.add_field(name="Members", value=participant_names, inline=False)
-        await text_channel.send(embed=embed)
-    except Exception as e:
-        logger.warning(f"Failed sending initial participants embed: {e}")
     
     await ctx.send(f"✅ Meeting started! Live transcriptions in **{language_display}** will appear in {text_channel.mention}")
 
