@@ -286,6 +286,10 @@ class TranscriptionSink(voice_recv.AudioSink):
         elapsed = (now - self.last_time[uid]).total_seconds()
         current_buffer_size = len(self.buffers[uid])
         
+        # Debug logging
+        if hasattr(self, 'debug_mode') and self.debug_mode:
+            logger.info(f"Audio buffer for {user.display_name}: {current_buffer_size} bytes, elapsed: {elapsed:.1f}s")
+        
         # Process audio when buffer is ready (time-based or size-based)
         should_process = (
             elapsed >= self.buffer_duration and 
@@ -296,8 +300,13 @@ class TranscriptionSink(voice_recv.AudioSink):
         # Force processing if buffer gets too large (prevents long delays)
         if current_buffer_size >= self.max_buffer_size and not self.processing[uid]:
             should_process = True
+            if hasattr(self, 'debug_mode') and self.debug_mode:
+                logger.info(f"Force processing {user.display_name} due to large buffer: {current_buffer_size} bytes")
         
         if should_process:
+            if hasattr(self, 'debug_mode') and self.debug_mode:
+                logger.info(f"Processing audio for {user.display_name}: {current_buffer_size} bytes, {elapsed:.1f}s elapsed")
+            
             # Schedule processing
             def schedule_transcription():
                 try:
@@ -404,8 +413,8 @@ class TranscriptionSink(voice_recv.AudioSink):
                 sample_rate = wav_file.getframerate()
                 duration = frames / sample_rate
                 
-                # Skip very short audio segments (likely noise)
-                if duration < 0.5:
+                # Skip very short audio segments (likely noise) - made less strict
+                if duration < 0.3:  # Reduced from 0.5s
                     return ""
                 
                 # Skip very long audio segments (likely errors)
@@ -415,25 +424,25 @@ class TranscriptionSink(voice_recv.AudioSink):
             
             language_code = None if self.language == "auto" else self.language
             
-            # Conservative transcription parameters to reduce hallucination
+            # Balanced transcription parameters - less strict but still good quality
             segments, info = model.transcribe(
                 wav_buffer, 
                 language=language_code,
                 vad_filter=True,
                 vad_parameters=dict(
-                    min_silence_duration_ms=800,  # Increased from 500ms
-                    speech_pad_ms=400,  # Add padding around speech
-                    threshold=0.5  # More conservative VAD threshold
+                    min_silence_duration_ms=600,  # Reduced from 800ms
+                    speech_pad_ms=300,  # Reduced padding
+                    threshold=0.4  # Less strict VAD threshold
                 ),
                 word_timestamps=False,  # Disabled to reduce processing errors
                 condition_on_previous_text=False,  # Disabled to prevent context hallucination
-                compression_ratio_threshold=1.8,  # Reduced from 2.4 (more conservative)
-                log_prob_threshold=-0.8,  # Increased from -1.0 (more confident predictions)
-                no_speech_threshold=0.8,  # Increased from 0.6 (more strict silence detection)
+                compression_ratio_threshold=2.0,  # Increased from 1.8 (less strict)
+                log_prob_threshold=-1.0,  # Reduced from -0.8 (more permissive)
+                no_speech_threshold=0.6,  # Reduced from 0.8 (less strict silence detection)
                 temperature=0.0,  # Keep deterministic
-                beam_size=3,  # Reduced from 5 for faster, more focused processing
+                beam_size=3,  # Keep focused processing
                 best_of=1,  # Only use best result
-                repetition_penalty=1.2,  # Prevent repetitive outputs
+                repetition_penalty=1.1,  # Reduced penalty
                 length_penalty=1.0,  # Neutral length penalty
                 prompt_reset_on_timestamp=True,  # Reset context between segments
                 suppress_blank=True,  # Suppress blank outputs
@@ -445,22 +454,22 @@ class TranscriptionSink(voice_recv.AudioSink):
             for segment in segments:
                 text = segment.text.strip()
                 
-                # Additional quality checks
+                # Less strict quality checks
                 if text and len(text) > 1:
-                    # Skip segments that are too short (likely noise)
-                    if len(text) < 3:
+                    # Skip segments that are too short (likely noise) - made less strict
+                    if len(text) < 2:  # Reduced from 3
                         continue
                     
                     # Skip segments that are too long (likely concatenated)
-                    if len(text) > 200:
+                    if len(text) > 300:  # Increased from 200
                         logger.warning(f"Segment too long ({len(text)} chars), truncating")
-                        text = text[:200] + "..."
+                        text = text[:300] + "..."
                     
-                    # Skip segments with excessive repetition
+                    # Skip segments with excessive repetition - made less strict
                     words = text.split()
-                    if len(words) > 3:
+                    if len(words) > 5:  # Increased from 3
                         unique_words = len(set(words))
-                        if unique_words / len(words) < 0.3:  # Less than 30% unique words
+                        if unique_words / len(words) < 0.2:  # Reduced from 0.3 (more permissive)
                             logger.warning(f"Segment has excessive repetition, skipping")
                             continue
                     
@@ -469,7 +478,7 @@ class TranscriptionSink(voice_recv.AudioSink):
             # Join segments with proper spacing
             result = " ".join(text_segments)
             
-            # Final quality check
+            # Final quality check - less strict
             if result and len(result.strip()) > 0:
                 # Remove excessive whitespace
                 result = " ".join(result.split())
@@ -1611,6 +1620,137 @@ async def filter_transcript(ctx, action: str = None, entry_id: int = None):
     else:
         await ctx.send("❌ Invalid action. Use: `list`, `remove <id>`, or `clean`")
 
+@bot.command(name='debug_transcription', aliases=['debug', 'transcription_debug'])
+async def debug_transcription(ctx, mode: str = None):
+    """Enable or disable transcription debug mode to troubleshoot issues.
+    
+    Usage: 
+        !debug_transcription - Show current debug status
+        !debug_transcription on - Enable debug mode (shows detailed info)
+        !debug_transcription off - Disable debug mode
+    """
+    guild_id = ctx.guild.id
+    
+    if guild_id not in active_meetings:
+        await ctx.send("❌ No active meeting found in this server.")
+        return
+    
+    meeting = active_meetings[guild_id]
+    sink = meeting.get("sink")
+    
+    if not sink:
+        await ctx.send("❌ Transcription sink not available.")
+        return
+    
+    if mode is None:
+        # Show current debug status
+        embed = discord.Embed(
+            title="🐛 Transcription Debug Mode",
+            description="Current transcription debugging configuration",
+            color=0xffff00
+        )
+        
+        debug_enabled = hasattr(sink, 'debug_mode') and sink.debug_mode
+        status = "🟢 **ENABLED**" if debug_enabled else "🔴 **DISABLED**"
+        embed.add_field(name="Status", value=status, inline=True)
+        
+        embed.add_field(
+            name="📊 Current Settings", 
+            value=f"Buffer Duration: {sink.buffer_duration}s\nMin Buffer: {sink.min_buffer_size} bytes\nVAD Threshold: {getattr(sink, 'vad_threshold', 'N/A')}", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="💡 Debug Info Shows", 
+            value="• Audio buffer sizes\n• VAD detection results\n• Transcription attempts\n• Filtering decisions\n• Error details", 
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💡 Commands", 
+            value="• `!debug_transcription on` - Enable debug mode\n• `!debug_transcription off` - Disable debug mode", 
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        return
+    
+    # Change debug mode
+    if mode.lower() in ["on", "true", "1", "enable"]:
+        sink.debug_mode = True
+        await ctx.send("🐛 **Debug mode enabled!** You'll see detailed transcription information in the logs.")
+        
+    elif mode.lower() in ["off", "false", "0", "disable"]:
+        sink.debug_mode = False
+        await ctx.send("🔴 Debug mode disabled.")
+        
+    else:
+        await ctx.send("❌ Invalid mode. Use: `on` or `off`")
+
+@bot.command(name='test_audio', aliases=['test_mic', 'audio_test'])
+async def test_audio(ctx):
+    """Test if audio is being received and processed."""
+    guild_id = ctx.guild.id
+    
+    if guild_id not in active_meetings:
+        await ctx.send("❌ No active meeting found in this server.")
+        return
+    
+    meeting = active_meetings[guild_id]
+    sink = meeting.get("sink")
+    
+    if not sink:
+        await ctx.send("❌ Transcription sink not available.")
+        return
+    
+    # Show audio buffer status
+    embed = discord.Embed(
+        title="🎤 Audio Buffer Status",
+        description="Current audio processing status",
+        color=0x00ff00
+    )
+    
+    total_buffers = len(sink.buffers)
+    active_buffers = sum(1 for uid, buffer in sink.buffers.items() if len(buffer) > 0)
+    processing_users = sum(1 for uid, processing in sink.processing.items() if processing)
+    
+    embed.add_field(
+        name="📊 Buffer Status", 
+        value=f"Total Users: {total_buffers}\nActive Buffers: {active_buffers}\nProcessing: {processing_users}", 
+        inline=True
+    )
+    
+    # Show individual user buffer info
+    if sink.buffers:
+        buffer_info = []
+        for uid, buffer in sink.buffers.items():
+            buffer_size = len(buffer)
+            if buffer_size > 0:
+                # Try to get user name
+                user_name = "Unknown"
+                for guild in ctx.bot.guilds:
+                    member = guild.get_member(uid)
+                    if member:
+                        user_name = member.display_name
+                        break
+                
+                buffer_info.append(f"**{user_name}**: {buffer_size} bytes")
+        
+        if buffer_info:
+            embed.add_field(
+                name="👥 User Buffers", 
+                value="\n".join(buffer_info[:5]),  # Show first 5 users
+                inline=True
+            )
+    
+    embed.add_field(
+        name="💡 What This Means", 
+        value="• **Active Buffers**: Users with audio data\n• **Processing**: Users currently being transcribed\n• **Buffer Size**: Amount of audio collected", 
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
+
 # ==== Error Handling ====
 @bot.event
 async def on_command_error(ctx, error):
@@ -1690,6 +1830,16 @@ async def meeting_help(ctx):
     embed.add_field(
         name="!filter_transcript", 
         value="Filter and clean transcriptions to remove hallucinations", 
+        inline=False
+    )
+    embed.add_field(
+        name="!debug_transcription", 
+        value="Enable debug mode to troubleshoot transcription issues", 
+        inline=False
+    )
+    embed.add_field(
+        name="!test_audio", 
+        value="Test if audio is being received and processed", 
         inline=False
     )
     embed.add_field(
