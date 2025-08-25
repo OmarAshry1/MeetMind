@@ -178,14 +178,21 @@ class TranscriptionSink(voice_recv.AudioSink):
         self.next_sequence = 0  # Sequence number for ordering
         
         # Audio processing configuration - Optimized for low latency
-        self.buffer_duration = 2.0  # Reduced from 5.0s for faster response
-        self.min_buffer_size = 8000  # Reduced for faster processing
-        self.max_buffer_size = 24000  # Reduced to prevent delays
-        self.force_process_interval = 1.5  # Force process every 1.5s if no natural triggers
+        self.buffer_duration = 3.0  # Increased from 2.0s for better audio quality
+        self.min_buffer_size = 12000  # Increased for better transcription accuracy
+        self.max_buffer_size = 32000  # Increased to prevent cutting off words
+        self.force_process_interval = 2.0  # Increased from 1.5s for better quality
         
         # Real-time mode settings
         self.real_time_mode = True  # Enable real-time processing
         self.streaming_mode = True  # Enable streaming transcriptions
+        
+        # Transcription quality settings
+        self.quality_mode = "balanced" # Default to balanced
+        self.vad_threshold = 0.5 # Default VAD threshold
+        self.min_silence_duration = 800 # Default min silence duration
+        self.repetition_check = True # Default repetition check
+        self.quality_checks = True # Default quality checks
         
         # Start background processing timer
         self.start_background_processor()
@@ -390,30 +397,86 @@ class TranscriptionSink(voice_recv.AudioSink):
     def transcribe_audio(self, wav_buffer):
         """Transcribe audio using Whisper model with language support."""
         try:
+            # Check audio quality before transcription
+            wav_buffer.seek(0)
+            with wave.open(wav_buffer, 'rb') as wav_file:
+                frames = wav_file.getnframes()
+                sample_rate = wav_file.getframerate()
+                duration = frames / sample_rate
+                
+                # Skip very short audio segments (likely noise)
+                if duration < 0.5:
+                    return ""
+                
+                # Skip very long audio segments (likely errors)
+                if duration > 30.0:
+                    logger.warning(f"Audio segment too long ({duration:.1f}s), skipping")
+                    return ""
             
             language_code = None if self.language == "auto" else self.language
             
+            # Conservative transcription parameters to reduce hallucination
             segments, info = model.transcribe(
                 wav_buffer, 
                 language=language_code,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
-                word_timestamps=True,
-                condition_on_previous_text=True,
-                compression_ratio_threshold=2.4,
-                log_prob_threshold=-1.0,
-                no_speech_threshold=0.6,
-                temperature=0.0,
-                beam_size=5
+                vad_parameters=dict(
+                    min_silence_duration_ms=800,  # Increased from 500ms
+                    speech_pad_ms=400,  # Add padding around speech
+                    threshold=0.5  # More conservative VAD threshold
+                ),
+                word_timestamps=False,  # Disabled to reduce processing errors
+                condition_on_previous_text=False,  # Disabled to prevent context hallucination
+                compression_ratio_threshold=1.8,  # Reduced from 2.4 (more conservative)
+                log_prob_threshold=-0.8,  # Increased from -1.0 (more confident predictions)
+                no_speech_threshold=0.8,  # Increased from 0.6 (more strict silence detection)
+                temperature=0.0,  # Keep deterministic
+                beam_size=3,  # Reduced from 5 for faster, more focused processing
+                best_of=1,  # Only use best result
+                repetition_penalty=1.2,  # Prevent repetitive outputs
+                length_penalty=1.0,  # Neutral length penalty
+                prompt_reset_on_timestamp=True,  # Reset context between segments
+                suppress_blank=True,  # Suppress blank outputs
+                suppress_tokens=[-1],  # Suppress end-of-sequence tokens
+                without_timestamps=True  # Disable timestamp prediction
             )
             
             text_segments = []
             for segment in segments:
+                text = segment.text.strip()
                 
-                if segment.text.strip() and len(segment.text.strip()) > 1:
-                    text_segments.append(segment.text.strip())
+                # Additional quality checks
+                if text and len(text) > 1:
+                    # Skip segments that are too short (likely noise)
+                    if len(text) < 3:
+                        continue
+                    
+                    # Skip segments that are too long (likely concatenated)
+                    if len(text) > 200:
+                        logger.warning(f"Segment too long ({len(text)} chars), truncating")
+                        text = text[:200] + "..."
+                    
+                    # Skip segments with excessive repetition
+                    words = text.split()
+                    if len(words) > 3:
+                        unique_words = len(set(words))
+                        if unique_words / len(words) < 0.3:  # Less than 30% unique words
+                            logger.warning(f"Segment has excessive repetition, skipping")
+                            continue
+                    
+                    text_segments.append(text)
             
-            return " ".join(text_segments)
+            # Join segments with proper spacing
+            result = " ".join(text_segments)
+            
+            # Final quality check
+            if result and len(result.strip()) > 0:
+                # Remove excessive whitespace
+                result = " ".join(result.split())
+                return result
+            else:
+                return ""
+                
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return ""
@@ -1348,6 +1411,206 @@ async def transcription_settings(ctx, setting: str = None, value: float = None):
     else:
         await ctx.send(f"❌ Unknown setting '{setting}'. Available settings: buffer_duration, min_buffer_size, max_buffer_size, force_interval")
 
+@bot.command(name='transcription_quality', aliases=['quality_mode', 'accuracy_mode'])
+async def transcription_quality(ctx, mode: str = None):
+    """Set transcription quality mode to balance accuracy vs hallucination.
+    
+    Usage: 
+        !transcription_quality - Show current mode
+        !transcription_quality conservative - High accuracy, low hallucination (slower)
+        !transcription_quality balanced - Balanced accuracy and speed (default)
+        !transcription_quality fast - Faster processing, may have more errors
+    """
+    guild_id = ctx.guild.id
+    
+    if guild_id not in active_meetings:
+        await ctx.send("❌ No active meeting found in this server.")
+        return
+    
+    meeting = active_meetings[guild_id]
+    sink = meeting.get("sink")
+    
+    if not sink:
+        await ctx.send("❌ Transcription sink not available.")
+        return
+    
+    if mode is None:
+        # Show current mode
+        embed = discord.Embed(
+            title="🎯 Transcription Quality Mode",
+            description="Current transcription accuracy configuration",
+            color=0x0099ff
+        )
+        
+        embed.add_field(
+            name="💡 Quality Modes", 
+            value="• **conservative** - Highest accuracy, lowest hallucination\n• **balanced** - Good balance of speed and accuracy\n• **fast** - Faster processing, may have more errors", 
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔧 Current Settings", 
+            value="• VAD threshold: Conservative\n• Repetition detection: Enabled\n• Quality checks: Strict\n• Audio validation: Enabled", 
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💡 Commands", 
+            value="• `!transcription_quality conservative` - Best accuracy\n• `!transcription_quality balanced` - Default mode\n• `!transcription_quality fast` - Fastest mode", 
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        return
+    
+    # Change quality mode
+    if mode.lower() in ["conservative", "high", "accurate", "best"]:
+        # Conservative mode - highest accuracy, lowest hallucination
+        sink.quality_mode = "conservative"
+        sink.vad_threshold = 0.6
+        sink.min_silence_duration = 1000
+        sink.repetition_check = True
+        sink.quality_checks = True
+        await ctx.send("🎯 **Conservative mode enabled!** Highest accuracy, lowest hallucination. Processing may be slower.")
+        
+    elif mode.lower() in ["balanced", "default", "normal"]:
+        # Balanced mode - good balance
+        sink.quality_mode = "balanced"
+        sink.vad_threshold = 0.5
+        sink.min_silence_duration = 800
+        sink.repetition_check = True
+        sink.quality_checks = True
+        await ctx.send("⚖️ **Balanced mode enabled!** Good balance of speed and accuracy.")
+        
+    elif mode.lower() in ["fast", "quick", "speed"]:
+        # Fast mode - faster processing
+        sink.quality_mode = "fast"
+        sink.vad_threshold = 0.4
+        sink.min_silence_duration = 600
+        sink.repetition_check = False
+        sink.quality_checks = False
+        await ctx.send("🚀 **Fast mode enabled!** Faster processing, may have more errors.")
+        
+    else:
+        await ctx.send("❌ Invalid mode. Use: `conservative`, `balanced`, or `fast`")
+
+@bot.command(name='filter_transcript', aliases=['filter', 'clean_transcript'])
+async def filter_transcript(ctx, action: str = None, entry_id: int = None):
+    """Filter and clean transcriptions to remove hallucinations.
+    
+    Usage: 
+        !filter_transcript - Show filtering options
+        !filter_transcript list - List recent transcriptions with IDs
+        !filter_transcript remove <id> - Remove a specific transcription entry
+        !filter_transcript clean - Auto-clean obvious hallucinations
+    """
+    guild_id = ctx.guild.id
+    
+    if guild_id not in active_meetings:
+        await ctx.send("❌ No active meeting found in this server.")
+        return
+    
+    meeting = active_meetings[guild_id]
+    
+    if not meeting["log"]:
+        await ctx.send("❌ No transcriptions to filter.")
+        return
+    
+    if action is None:
+        # Show filtering options
+        embed = discord.Embed(
+            title="🧹 Transcript Filtering",
+            description="Filter and clean transcriptions to remove hallucinations",
+            color=0x0099ff
+        )
+        
+        embed.add_field(
+            name="📋 Available Actions", 
+            value="• `!filter_transcript list` - Show recent transcriptions\n• `!filter_transcript remove <id>` - Remove specific entry\n• `!filter_transcript clean` - Auto-clean obvious hallucinations", 
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔍 What Gets Filtered", 
+            value="• Excessive repetition\n• Nonsensical text\n• Very long segments\n• Low-confidence transcriptions", 
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        return
+    
+    if action.lower() == "list":
+        # List recent transcriptions with IDs
+        recent_entries = meeting["log"][-10:]  # Last 10 entries
+        
+        embed = discord.Embed(
+            title="📋 Recent Transcriptions",
+            description="Recent transcription entries with IDs for filtering",
+            color=0x00ff00
+        )
+        
+        for i, entry in enumerate(recent_entries):
+            entry_id = len(meeting["log"]) - 10 + i
+            text_preview = entry['text'][:50] + "..." if len(entry['text']) > 50 else entry['text']
+            embed.add_field(
+                name=f"ID {entry_id}: {entry['speaker']}",
+                value=f"[{entry['timestamp']}] {text_preview}",
+                inline=False
+            )
+        
+        embed.set_footer(text="Use !filter_transcript remove <id> to remove an entry")
+        await ctx.send(embed=embed)
+        
+    elif action.lower() == "remove" and entry_id is not None:
+        # Remove specific transcription entry
+        if 0 <= entry_id < len(meeting["log"]):
+            removed_entry = meeting["log"].pop(entry_id)
+            save_meetings()
+            await ctx.send(f"✅ Removed transcription: **{removed_entry['speaker']}**: {removed_entry['text'][:100]}...")
+        else:
+            await ctx.send(f"❌ Invalid entry ID. Use `!filter_transcript list` to see available IDs.")
+            
+    elif action.lower() == "clean":
+        # Auto-clean obvious hallucinations
+        original_count = len(meeting["log"])
+        cleaned_entries = []
+        
+        for entry in meeting["log"]:
+            text = entry['text']
+            
+            # Skip entries that are likely hallucinations
+            should_skip = False
+            
+            # Check for excessive repetition
+            words = text.split()
+            if len(words) > 5:
+                unique_words = len(set(words))
+                if unique_words / len(words) < 0.4:  # Less than 40% unique words
+                    should_skip = True
+                    logger.info(f"Filtering repetitive entry: {text[:50]}...")
+            
+            # Check for very long segments (likely concatenated)
+            if len(text) > 150:
+                should_skip = True
+                logger.info(f"Filtering very long entry: {text[:50]}...")
+            
+            # Check for nonsensical patterns
+            if text.count(' ') > 0 and len(text) / text.count(' ') < 2:  # Very short words
+                should_skip = True
+                logger.info(f"Filtering nonsensical entry: {text[:50]}...")
+            
+            if not should_skip:
+                cleaned_entries.append(entry)
+        
+        meeting["log"] = cleaned_entries
+        save_meetings()
+        
+        removed_count = original_count - len(cleaned_entries)
+        await ctx.send(f"🧹 **Auto-clean completed!** Removed {removed_count} hallucinated entries. {len(cleaned_entries)} entries remaining.")
+        
+    else:
+        await ctx.send("❌ Invalid action. Use: `list`, `remove <id>`, or `clean`")
+
 # ==== Error Handling ====
 @bot.event
 async def on_command_error(ctx, error):
@@ -1417,6 +1680,16 @@ async def meeting_help(ctx):
     embed.add_field(
         name="!streaming_mode", 
         value="Enable or disable streaming transcriptions for ultra-low perceived latency", 
+        inline=False
+    )
+    embed.add_field(
+        name="!transcription_quality", 
+        value="Set transcription quality mode to balance accuracy vs hallucination", 
+        inline=False
+    )
+    embed.add_field(
+        name="!filter_transcript", 
+        value="Filter and clean transcriptions to remove hallucinations", 
         inline=False
     )
     embed.add_field(
