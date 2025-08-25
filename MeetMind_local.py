@@ -178,21 +178,14 @@ class TranscriptionSink(voice_recv.AudioSink):
         self.next_sequence = 0  # Sequence number for ordering
         
         # Audio processing configuration - Optimized for low latency
-        self.buffer_duration = 3.0  # Increased from 2.0s for better audio quality
-        self.min_buffer_size = 12000  # Increased for better transcription accuracy
-        self.max_buffer_size = 32000  # Increased to prevent cutting off words
-        self.force_process_interval = 2.0  # Increased from 1.5s for better quality
+        self.buffer_duration = 2.0  # Reduced from 5.0s for faster response
+        self.min_buffer_size = 8000  # Reduced for faster processing
+        self.max_buffer_size = 24000  # Reduced to prevent delays
+        self.force_process_interval = 1.5  # Force process every 1.5s if no natural triggers
         
         # Real-time mode settings
         self.real_time_mode = True  # Enable real-time processing
         self.streaming_mode = True  # Enable streaming transcriptions
-        
-        # Transcription quality settings
-        self.quality_mode = "balanced" # Default to balanced
-        self.vad_threshold = 0.5 # Default VAD threshold
-        self.min_silence_duration = 800 # Default min silence duration
-        self.repetition_check = True # Default repetition check
-        self.quality_checks = True # Default quality checks
         
         # Start background processing timer
         self.start_background_processor()
@@ -286,10 +279,6 @@ class TranscriptionSink(voice_recv.AudioSink):
         elapsed = (now - self.last_time[uid]).total_seconds()
         current_buffer_size = len(self.buffers[uid])
         
-        # Debug logging
-        if hasattr(self, 'debug_mode') and self.debug_mode:
-            logger.info(f"Audio buffer for {user.display_name}: {current_buffer_size} bytes, elapsed: {elapsed:.1f}s")
-        
         # Process audio when buffer is ready (time-based or size-based)
         should_process = (
             elapsed >= self.buffer_duration and 
@@ -300,13 +289,8 @@ class TranscriptionSink(voice_recv.AudioSink):
         # Force processing if buffer gets too large (prevents long delays)
         if current_buffer_size >= self.max_buffer_size and not self.processing[uid]:
             should_process = True
-            if hasattr(self, 'debug_mode') and self.debug_mode:
-                logger.info(f"Force processing {user.display_name} due to large buffer: {current_buffer_size} bytes")
         
         if should_process:
-            if hasattr(self, 'debug_mode') and self.debug_mode:
-                logger.info(f"Processing audio for {user.display_name}: {current_buffer_size} bytes, {elapsed:.1f}s elapsed")
-            
             # Schedule processing
             def schedule_transcription():
                 try:
@@ -406,86 +390,30 @@ class TranscriptionSink(voice_recv.AudioSink):
     def transcribe_audio(self, wav_buffer):
         """Transcribe audio using Whisper model with language support."""
         try:
-            # Check audio quality before transcription
-            wav_buffer.seek(0)
-            with wave.open(wav_buffer, 'rb') as wav_file:
-                frames = wav_file.getnframes()
-                sample_rate = wav_file.getframerate()
-                duration = frames / sample_rate
-                
-                # Skip very short audio segments (likely noise) - made less strict
-                if duration < 0.3:  # Reduced from 0.5s
-                    return ""
-                
-                # Skip very long audio segments (likely errors)
-                if duration > 30.0:
-                    logger.warning(f"Audio segment too long ({duration:.1f}s), skipping")
-                    return ""
             
             language_code = None if self.language == "auto" else self.language
             
-            # Balanced transcription parameters - less strict but still good quality
             segments, info = model.transcribe(
                 wav_buffer, 
                 language=language_code,
                 vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=600,  # Reduced from 800ms
-                    speech_pad_ms=300,  # Reduced padding
-                    threshold=0.4  # Less strict VAD threshold
-                ),
-                word_timestamps=False,  # Disabled to reduce processing errors
-                condition_on_previous_text=False,  # Disabled to prevent context hallucination
-                compression_ratio_threshold=2.0,  # Increased from 1.8 (less strict)
-                log_prob_threshold=-1.0,  # Reduced from -0.8 (more permissive)
-                no_speech_threshold=0.6,  # Reduced from 0.8 (less strict silence detection)
-                temperature=0.0,  # Keep deterministic
-                beam_size=3,  # Keep focused processing
-                best_of=1,  # Only use best result
-                repetition_penalty=1.1,  # Reduced penalty
-                length_penalty=1.0,  # Neutral length penalty
-                prompt_reset_on_timestamp=True,  # Reset context between segments
-                suppress_blank=True,  # Suppress blank outputs
-                suppress_tokens=[-1],  # Suppress end-of-sequence tokens
-                without_timestamps=True  # Disable timestamp prediction
+                vad_parameters=dict(min_silence_duration_ms=500),
+                word_timestamps=True,
+                condition_on_previous_text=True,
+                compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0,
+                no_speech_threshold=0.6,
+                temperature=0.0,
+                beam_size=5
             )
             
             text_segments = []
             for segment in segments:
-                text = segment.text.strip()
                 
-                # Less strict quality checks
-                if text and len(text) > 1:
-                    # Skip segments that are too short (likely noise) - made less strict
-                    if len(text) < 2:  # Reduced from 3
-                        continue
-                    
-                    # Skip segments that are too long (likely concatenated)
-                    if len(text) > 300:  # Increased from 200
-                        logger.warning(f"Segment too long ({len(text)} chars), truncating")
-                        text = text[:300] + "..."
-                    
-                    # Skip segments with excessive repetition - made less strict
-                    words = text.split()
-                    if len(words) > 5:  # Increased from 3
-                        unique_words = len(set(words))
-                        if unique_words / len(words) < 0.2:  # Reduced from 0.3 (more permissive)
-                            logger.warning(f"Segment has excessive repetition, skipping")
-                            continue
-                    
-                    text_segments.append(text)
+                if segment.text.strip() and len(segment.text.strip()) > 1:
+                    text_segments.append(segment.text.strip())
             
-            # Join segments with proper spacing
-            result = " ".join(text_segments)
-            
-            # Final quality check - less strict
-            if result and len(result.strip()) > 0:
-                # Remove excessive whitespace
-                result = " ".join(result.split())
-                return result
-            else:
-                return ""
-                
+            return " ".join(text_segments)
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return ""
@@ -1420,337 +1348,6 @@ async def transcription_settings(ctx, setting: str = None, value: float = None):
     else:
         await ctx.send(f"❌ Unknown setting '{setting}'. Available settings: buffer_duration, min_buffer_size, max_buffer_size, force_interval")
 
-@bot.command(name='transcription_quality', aliases=['quality_mode', 'accuracy_mode'])
-async def transcription_quality(ctx, mode: str = None):
-    """Set transcription quality mode to balance accuracy vs hallucination.
-    
-    Usage: 
-        !transcription_quality - Show current mode
-        !transcription_quality conservative - High accuracy, low hallucination (slower)
-        !transcription_quality balanced - Balanced accuracy and speed (default)
-        !transcription_quality fast - Faster processing, may have more errors
-    """
-    guild_id = ctx.guild.id
-    
-    if guild_id not in active_meetings:
-        await ctx.send("❌ No active meeting found in this server.")
-        return
-    
-    meeting = active_meetings[guild_id]
-    sink = meeting.get("sink")
-    
-    if not sink:
-        await ctx.send("❌ Transcription sink not available.")
-        return
-    
-    if mode is None:
-        # Show current mode
-        embed = discord.Embed(
-            title="🎯 Transcription Quality Mode",
-            description="Current transcription accuracy configuration",
-            color=0x0099ff
-        )
-        
-        embed.add_field(
-            name="💡 Quality Modes", 
-            value="• **conservative** - Highest accuracy, lowest hallucination\n• **balanced** - Good balance of speed and accuracy\n• **fast** - Faster processing, may have more errors", 
-            inline=False
-        )
-        
-        embed.add_field(
-            name="🔧 Current Settings", 
-            value="• VAD threshold: Conservative\n• Repetition detection: Enabled\n• Quality checks: Strict\n• Audio validation: Enabled", 
-            inline=False
-        )
-        
-        embed.add_field(
-            name="💡 Commands", 
-            value="• `!transcription_quality conservative` - Best accuracy\n• `!transcription_quality balanced` - Default mode\n• `!transcription_quality fast` - Fastest mode", 
-            inline=False
-        )
-        
-        await ctx.send(embed=embed)
-        return
-    
-    # Change quality mode
-    if mode.lower() in ["conservative", "high", "accurate", "best"]:
-        # Conservative mode - highest accuracy, lowest hallucination
-        sink.quality_mode = "conservative"
-        sink.vad_threshold = 0.6
-        sink.min_silence_duration = 1000
-        sink.repetition_check = True
-        sink.quality_checks = True
-        await ctx.send("🎯 **Conservative mode enabled!** Highest accuracy, lowest hallucination. Processing may be slower.")
-        
-    elif mode.lower() in ["balanced", "default", "normal"]:
-        # Balanced mode - good balance
-        sink.quality_mode = "balanced"
-        sink.vad_threshold = 0.5
-        sink.min_silence_duration = 800
-        sink.repetition_check = True
-        sink.quality_checks = True
-        await ctx.send("⚖️ **Balanced mode enabled!** Good balance of speed and accuracy.")
-        
-    elif mode.lower() in ["fast", "quick", "speed"]:
-        # Fast mode - faster processing
-        sink.quality_mode = "fast"
-        sink.vad_threshold = 0.4
-        sink.min_silence_duration = 600
-        sink.repetition_check = False
-        sink.quality_checks = False
-        await ctx.send("🚀 **Fast mode enabled!** Faster processing, may have more errors.")
-        
-    else:
-        await ctx.send("❌ Invalid mode. Use: `conservative`, `balanced`, or `fast`")
-
-@bot.command(name='filter_transcript', aliases=['filter', 'clean_transcript'])
-async def filter_transcript(ctx, action: str = None, entry_id: int = None):
-    """Filter and clean transcriptions to remove hallucinations.
-    
-    Usage: 
-        !filter_transcript - Show filtering options
-        !filter_transcript list - List recent transcriptions with IDs
-        !filter_transcript remove <id> - Remove a specific transcription entry
-        !filter_transcript clean - Auto-clean obvious hallucinations
-    """
-    guild_id = ctx.guild.id
-    
-    if guild_id not in active_meetings:
-        await ctx.send("❌ No active meeting found in this server.")
-        return
-    
-    meeting = active_meetings[guild_id]
-    
-    if not meeting["log"]:
-        await ctx.send("❌ No transcriptions to filter.")
-        return
-    
-    if action is None:
-        # Show filtering options
-        embed = discord.Embed(
-            title="🧹 Transcript Filtering",
-            description="Filter and clean transcriptions to remove hallucinations",
-            color=0x0099ff
-        )
-        
-        embed.add_field(
-            name="📋 Available Actions", 
-            value="• `!filter_transcript list` - Show recent transcriptions\n• `!filter_transcript remove <id>` - Remove specific entry\n• `!filter_transcript clean` - Auto-clean obvious hallucinations", 
-            inline=False
-        )
-        
-        embed.add_field(
-            name="🔍 What Gets Filtered", 
-            value="• Excessive repetition\n• Nonsensical text\n• Very long segments\n• Low-confidence transcriptions", 
-            inline=False
-        )
-        
-        await ctx.send(embed=embed)
-        return
-    
-    if action.lower() == "list":
-        # List recent transcriptions with IDs
-        recent_entries = meeting["log"][-10:]  # Last 10 entries
-        
-        embed = discord.Embed(
-            title="📋 Recent Transcriptions",
-            description="Recent transcription entries with IDs for filtering",
-            color=0x00ff00
-        )
-        
-        for i, entry in enumerate(recent_entries):
-            entry_id = len(meeting["log"]) - 10 + i
-            text_preview = entry['text'][:50] + "..." if len(entry['text']) > 50 else entry['text']
-            embed.add_field(
-                name=f"ID {entry_id}: {entry['speaker']}",
-                value=f"[{entry['timestamp']}] {text_preview}",
-                inline=False
-            )
-        
-        embed.set_footer(text="Use !filter_transcript remove <id> to remove an entry")
-        await ctx.send(embed=embed)
-        
-    elif action.lower() == "remove" and entry_id is not None:
-        # Remove specific transcription entry
-        if 0 <= entry_id < len(meeting["log"]):
-            removed_entry = meeting["log"].pop(entry_id)
-            save_meetings()
-            await ctx.send(f"✅ Removed transcription: **{removed_entry['speaker']}**: {removed_entry['text'][:100]}...")
-        else:
-            await ctx.send(f"❌ Invalid entry ID. Use `!filter_transcript list` to see available IDs.")
-            
-    elif action.lower() == "clean":
-        # Auto-clean obvious hallucinations
-        original_count = len(meeting["log"])
-        cleaned_entries = []
-        
-        for entry in meeting["log"]:
-            text = entry['text']
-            
-            # Skip entries that are likely hallucinations
-            should_skip = False
-            
-            # Check for excessive repetition
-            words = text.split()
-            if len(words) > 5:
-                unique_words = len(set(words))
-                if unique_words / len(words) < 0.4:  # Less than 40% unique words
-                    should_skip = True
-                    logger.info(f"Filtering repetitive entry: {text[:50]}...")
-            
-            # Check for very long segments (likely concatenated)
-            if len(text) > 150:
-                should_skip = True
-                logger.info(f"Filtering very long entry: {text[:50]}...")
-            
-            # Check for nonsensical patterns
-            if text.count(' ') > 0 and len(text) / text.count(' ') < 2:  # Very short words
-                should_skip = True
-                logger.info(f"Filtering nonsensical entry: {text[:50]}...")
-            
-            if not should_skip:
-                cleaned_entries.append(entry)
-        
-        meeting["log"] = cleaned_entries
-        save_meetings()
-        
-        removed_count = original_count - len(cleaned_entries)
-        await ctx.send(f"🧹 **Auto-clean completed!** Removed {removed_count} hallucinated entries. {len(cleaned_entries)} entries remaining.")
-        
-    else:
-        await ctx.send("❌ Invalid action. Use: `list`, `remove <id>`, or `clean`")
-
-@bot.command(name='debug_transcription', aliases=['debug', 'transcription_debug'])
-async def debug_transcription(ctx, mode: str = None):
-    """Enable or disable transcription debug mode to troubleshoot issues.
-    
-    Usage: 
-        !debug_transcription - Show current debug status
-        !debug_transcription on - Enable debug mode (shows detailed info)
-        !debug_transcription off - Disable debug mode
-    """
-    guild_id = ctx.guild.id
-    
-    if guild_id not in active_meetings:
-        await ctx.send("❌ No active meeting found in this server.")
-        return
-    
-    meeting = active_meetings[guild_id]
-    sink = meeting.get("sink")
-    
-    if not sink:
-        await ctx.send("❌ Transcription sink not available.")
-        return
-    
-    if mode is None:
-        # Show current debug status
-        embed = discord.Embed(
-            title="🐛 Transcription Debug Mode",
-            description="Current transcription debugging configuration",
-            color=0xffff00
-        )
-        
-        debug_enabled = hasattr(sink, 'debug_mode') and sink.debug_mode
-        status = "🟢 **ENABLED**" if debug_enabled else "🔴 **DISABLED**"
-        embed.add_field(name="Status", value=status, inline=True)
-        
-        embed.add_field(
-            name="📊 Current Settings", 
-            value=f"Buffer Duration: {sink.buffer_duration}s\nMin Buffer: {sink.min_buffer_size} bytes\nVAD Threshold: {getattr(sink, 'vad_threshold', 'N/A')}", 
-            inline=True
-        )
-        
-        embed.add_field(
-            name="💡 Debug Info Shows", 
-            value="• Audio buffer sizes\n• VAD detection results\n• Transcription attempts\n• Filtering decisions\n• Error details", 
-            inline=False
-        )
-        
-        embed.add_field(
-            name="💡 Commands", 
-            value="• `!debug_transcription on` - Enable debug mode\n• `!debug_transcription off` - Disable debug mode", 
-            inline=False
-        )
-        
-        await ctx.send(embed=embed)
-        return
-    
-    # Change debug mode
-    if mode.lower() in ["on", "true", "1", "enable"]:
-        sink.debug_mode = True
-        await ctx.send("🐛 **Debug mode enabled!** You'll see detailed transcription information in the logs.")
-        
-    elif mode.lower() in ["off", "false", "0", "disable"]:
-        sink.debug_mode = False
-        await ctx.send("🔴 Debug mode disabled.")
-        
-    else:
-        await ctx.send("❌ Invalid mode. Use: `on` or `off`")
-
-@bot.command(name='test_audio', aliases=['test_mic', 'audio_test'])
-async def test_audio(ctx):
-    """Test if audio is being received and processed."""
-    guild_id = ctx.guild.id
-    
-    if guild_id not in active_meetings:
-        await ctx.send("❌ No active meeting found in this server.")
-        return
-    
-    meeting = active_meetings[guild_id]
-    sink = meeting.get("sink")
-    
-    if not sink:
-        await ctx.send("❌ Transcription sink not available.")
-        return
-    
-    # Show audio buffer status
-    embed = discord.Embed(
-        title="🎤 Audio Buffer Status",
-        description="Current audio processing status",
-        color=0x00ff00
-    )
-    
-    total_buffers = len(sink.buffers)
-    active_buffers = sum(1 for uid, buffer in sink.buffers.items() if len(buffer) > 0)
-    processing_users = sum(1 for uid, processing in sink.processing.items() if processing)
-    
-    embed.add_field(
-        name="📊 Buffer Status", 
-        value=f"Total Users: {total_buffers}\nActive Buffers: {active_buffers}\nProcessing: {processing_users}", 
-        inline=True
-    )
-    
-    # Show individual user buffer info
-    if sink.buffers:
-        buffer_info = []
-        for uid, buffer in sink.buffers.items():
-            buffer_size = len(buffer)
-            if buffer_size > 0:
-                # Try to get user name
-                user_name = "Unknown"
-                for guild in ctx.bot.guilds:
-                    member = guild.get_member(uid)
-                    if member:
-                        user_name = member.display_name
-                        break
-                
-                buffer_info.append(f"**{user_name}**: {buffer_size} bytes")
-        
-        if buffer_info:
-            embed.add_field(
-                name="👥 User Buffers", 
-                value="\n".join(buffer_info[:5]),  # Show first 5 users
-                inline=True
-            )
-    
-    embed.add_field(
-        name="💡 What This Means", 
-        value="• **Active Buffers**: Users with audio data\n• **Processing**: Users currently being transcribed\n• **Buffer Size**: Amount of audio collected", 
-        inline=False
-    )
-    
-    await ctx.send(embed=embed)
-
 # ==== Error Handling ====
 @bot.event
 async def on_command_error(ctx, error):
@@ -1820,26 +1417,6 @@ async def meeting_help(ctx):
     embed.add_field(
         name="!streaming_mode", 
         value="Enable or disable streaming transcriptions for ultra-low perceived latency", 
-        inline=False
-    )
-    embed.add_field(
-        name="!transcription_quality", 
-        value="Set transcription quality mode to balance accuracy vs hallucination", 
-        inline=False
-    )
-    embed.add_field(
-        name="!filter_transcript", 
-        value="Filter and clean transcriptions to remove hallucinations", 
-        inline=False
-    )
-    embed.add_field(
-        name="!debug_transcription", 
-        value="Enable debug mode to troubleshoot transcription issues", 
-        inline=False
-    )
-    embed.add_field(
-        name="!test_audio", 
-        value="Test if audio is being received and processed", 
         inline=False
     )
     embed.add_field(
