@@ -363,190 +363,60 @@ class TranscriptionSink(voice_recv.AudioSink):
             text = transcription['text']
             
             # Add to meeting log
-            entry = {
-                'timestamp': timestamp,
-                'speaker': speaker,
+                entry = {
+                    'timestamp': timestamp,
+                    'speaker': speaker,
                 'text': text,
                 'user_id': transcription['user_id']
-            }
-            self.meeting["log"].append(entry)
-            
+                }
+                self.meeting["log"].append(entry)
+                
             # Save meetings after adding new transcription data
             save_meetings()
-            
+                
             # Send to channel
-            channel = self.meeting["channel"]
-            if channel:
-                try:
+                channel = self.meeting["channel"]
+                if channel:
+                    try:
                     await channel.send(f"[{timestamp}] **{speaker}**: {text}")
-                except discord.errors.NotFound:
-                    logger.warning("Text channel not found, meeting may have ended")
-                except Exception as e:
-                    logger.error(f"Error sending message to channel: {e}")
-            
+                    except discord.errors.NotFound:
+                        logger.warning("Text channel not found, meeting may have ended")
+                    except Exception as e:
+                        logger.error(f"Error sending message to channel: {e}")
+                        
             # Small delay to ensure proper ordering in Discord
             await asyncio.sleep(0.1)
     
     def transcribe_audio(self, wav_buffer):
-        """Transcribe audio using Whisper model with language support and hallucination detection."""
+        """Transcribe audio using Whisper model with language support."""
         try:
+            
             language_code = None if self.language == "auto" else self.language
             
-            # Enhanced Whisper settings to reduce hallucinations
             segments, info = model.transcribe(
                 wav_buffer, 
                 language=language_code,
                 vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=300,  # Reduced from 500ms for better silence detection
-                    speech_pad_ms=100,  # Add padding around speech
-                    threshold=0.5  # More aggressive VAD threshold
-                ),
+                vad_parameters=dict(min_silence_duration_ms=500),
                 word_timestamps=True,
-                condition_on_previous_text=False,  # Disable to reduce hallucinations
-                compression_ratio_threshold=1.8,  # Reduced from 2.4 for stricter filtering
-                log_prob_threshold=-0.8,  # Increased from -1.0 for better confidence
-                no_speech_threshold=0.8,  # Increased from 0.6 for stricter silence detection
-                temperature=0.0,  # Keep deterministic
-                beam_size=3,  # Reduced from 5 for faster processing
-                best_of=1  # Only return best result
+                condition_on_previous_text=True,
+                compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0,
+                no_speech_threshold=0.6,
+                temperature=0.0,
+                beam_size=5
             )
             
             text_segments = []
             for segment in segments:
-                # Filter out low-confidence segments
-                if hasattr(segment, 'avg_logprob') and segment.avg_logprob < -0.5:
-                    continue
                 
-                # Filter out very short segments (likely noise)
-                if len(segment.text.strip()) < 2:
-                    continue
-                
-                # Filter out common hallucination phrases
-                filtered_text = self.filter_hallucinations(segment.text.strip())
-                if filtered_text:
-                    text_segments.append(filtered_text)
+                if segment.text.strip() and len(segment.text.strip()) > 1:
+                    text_segments.append(segment.text.strip())
             
-            # Additional post-processing to remove suspicious patterns
-            final_text = self.post_process_transcription(" ".join(text_segments))
-            
-            return final_text
-            
+            return " ".join(text_segments)
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             return ""
-    
-    def filter_hallucinations(self, text):
-        """Filter out common hallucination phrases and suspicious text patterns."""
-        if not text:
-            return ""
-        
-        # Common hallucination phrases (add more as you encounter them)
-        hallucination_phrases = [
-            "thank you very much",
-            "thank you so much", 
-            "thank you",
-            "you're welcome",
-            "have a nice day",
-            "goodbye",
-            "see you later",
-            "take care",
-            "good night",
-            "good morning",
-            "good afternoon",
-            "hello there",
-            "hi there",
-            "how are you",
-            "nice to meet you",
-            "pleasure to meet you",
-            "excuse me",
-            "pardon me",
-            "i'm sorry",
-            "i apologize",
-            "that's all",
-            "that's it",
-            "end of message",
-            "end of transmission",
-            "over and out",
-            "roger that",
-            "copy that",
-            "affirmative",
-            "negative",
-            "yes sir",
-            "no sir",
-            "understood",
-            "got it",
-            "okay",
-            "alright",
-            "sure thing",
-            "no problem",
-            "my pleasure",
-            "anytime",
-            "of course",
-            "absolutely",
-            "definitely",
-            "certainly"
-        ]
-        
-        # Add custom filters if they exist
-        if hasattr(self, 'custom_hallucination_phrases'):
-            hallucination_phrases.extend(list(self.custom_hallucination_phrases))
-        
-        # Check for exact matches
-        text_lower = text.lower().strip()
-        for phrase in hallucination_phrases:
-            if text_lower == phrase:
-                logger.info(f"Filtered out hallucination phrase: '{text}'")
-                return ""
-        
-        # Check for suspicious patterns
-        suspicious_patterns = [
-            r'^\s*[a-z]+\s*$',  # Single word with spaces
-            r'^\s*[a-z]+\s+[a-z]+\s*$',  # Two words with spaces
-            r'^\s*[a-z]+\s+[a-z]+\s+[a-z]+\s*$',  # Three words with spaces
-        ]
-        
-        import re
-        for pattern in suspicious_patterns:
-            if re.match(pattern, text_lower):
-                # Check if it's a common phrase
-                if text_lower in hallucination_phrases or len(text.split()) <= 3:
-                    logger.info(f"Filtered out suspicious pattern: '{text}'")
-                    return ""
-        
-        # Additional checks for common hallucination indicators
-        if len(text.split()) <= 4:  # Very short phrases are suspicious
-            # Check if it's just polite phrases
-            polite_indicators = ['thank', 'sorry', 'excuse', 'pardon', 'goodbye', 'hello', 'hi', 'bye']
-            if any(indicator in text_lower for indicator in polite_indicators):
-                logger.info(f"Filtered out short polite phrase: '{text}'")
-                return ""
-        
-        return text
-    
-    def post_process_transcription(self, text):
-        """Post-process transcription to remove suspicious patterns and improve quality."""
-        if not text:
-            return ""
-        
-        # Remove excessive punctuation
-        import re
-        text = re.sub(r'[.!?]{2,}', '.', text)  # Multiple punctuation marks
-        text = re.sub(r'[,]{2,}', ',', text)    # Multiple commas
-        
-        # Remove standalone punctuation
-        text = re.sub(r'\s+[.!?,]\s*$', '', text)  # Punctuation at end
-        text = re.sub(r'^\s*[.!?,]\s+', '', text)  # Punctuation at start
-        
-        # Remove very short transcriptions (likely noise)
-        if len(text.strip()) < 3:
-            return ""
-        
-        # Remove transcriptions that are just punctuation or numbers
-        if re.match(r'^[\s\W\d]+$', text):
-            return ""
-        
-        return text.strip()
 
 
 async def get_meeting_context_from_channel(channel):
@@ -1248,7 +1118,7 @@ async def low_latency_mode(ctx, mode: str = None):
     
     if mode is None:
         # Show current mode
-        embed = discord.Embed(
+    embed = discord.Embed(
             title="⚡ Low Latency Mode Status",
             description="Current transcription latency configuration",
             color=0x00ff00 if sink.real_time_mode else 0xff0000
@@ -1279,8 +1149,8 @@ async def low_latency_mode(ctx, mode: str = None):
             value="• `!low_latency_mode on` - Enable fast mode\n• `!low_latency_mode ultra` - Enable ultra-fast mode\n• `!low_latency_mode off` - Disable fast mode", 
             inline=False
         )
-        
-        await ctx.send(embed=embed)
+    
+    await ctx.send(embed=embed)
         return
     
     # Change mode
@@ -1478,187 +1348,6 @@ async def transcription_settings(ctx, setting: str = None, value: float = None):
     else:
         await ctx.send(f"❌ Unknown setting '{setting}'. Available settings: buffer_duration, min_buffer_size, max_buffer_size, force_interval")
 
-@bot.command(name='hallucination_filter', aliases=['filter', 'block_phrases', 'anti_hallucination'])
-async def hallucination_filter(ctx, action: str = None, phrase: str = None):
-    """Manage hallucination filters to prevent false transcriptions.
-    
-    Usage: 
-        !hallucination_filter - Show current filters
-        !hallucination_filter add "thank you very much" - Add phrase to block
-        !hallucination_filter remove "thank you very much" - Remove phrase from block
-        !hallucination_filter list - Show all blocked phrases
-        !hallucination_filter clear - Clear all custom filters
-    """
-    guild_id = ctx.guild.id
-    
-    if guild_id not in active_meetings:
-        await ctx.send("❌ No active meeting found in this server.")
-        return
-    
-    meeting = active_meetings[guild_id]
-    sink = meeting.get("sink")
-    
-    if not sink:
-        await ctx.send("❌ Transcription sink not available.")
-        return
-    
-    # Initialize custom filters if not exists
-    if not hasattr(sink, 'custom_hallucination_phrases'):
-        sink.custom_hallucination_phrases = set()
-    
-    if action is None:
-        # Show current filter status
-        embed = discord.Embed(
-            title="🚫 Hallucination Filter Status",
-            description="Current settings to prevent false transcriptions",
-            color=0x00ff00
-        )
-        
-        embed.add_field(
-            name="Built-in Filters", 
-            value="🟢 **Active** (30+ common phrases)", 
-            inline=True
-        )
-        
-        embed.add_field(
-            name="Custom Filters", 
-            value=f"📝 **{len(sink.custom_hallucination_phrases)} phrases**", 
-            inline=True
-        )
-        
-        embed.add_field(
-            name="Filter Strength", 
-            value="🛡️ **High** (aggressive VAD + confidence thresholds)", 
-            inline=True
-        )
-        
-        embed.add_field(
-            name="💡 Commands", 
-            value="• `!hallucination_filter add \"phrase\"` - Block specific phrase\n• `!hallucination_filter remove \"phrase\"` - Unblock phrase\n• `!hallucination_filter list` - Show all blocked phrases", 
-            inline=False
-        )
-        
-        await ctx.send(embed=embed)
-        return
-    
-    if action.lower() == "add":
-        if not phrase:
-            await ctx.send("❌ Please provide a phrase to block. Example: `!hallucination_filter add \"thank you very much\"`")
-            return
-        
-        phrase_lower = phrase.lower().strip()
-        sink.custom_hallucination_phrases.add(phrase_lower)
-        await ctx.send(f"✅ Added \"{phrase}\" to hallucination filter. This phrase will no longer appear in transcriptions.")
-        
-    elif action.lower() == "remove":
-        if not phrase:
-            await ctx.send("❌ Please provide a phrase to unblock. Example: `!hallucination_filter remove \"thank you very much\"`")
-            return
-        
-        phrase_lower = phrase.lower().strip()
-        if phrase_lower in sink.custom_hallucination_phrases:
-            sink.custom_hallucination_phrases.remove(phrase_lower)
-            await ctx.send(f"✅ Removed \"{phrase}\" from hallucination filter.")
-        else:
-            await ctx.send(f"❌ \"{phrase}\" is not in the custom filter list.")
-            
-    elif action.lower() == "list":
-        if not sink.custom_hallucination_phrases:
-            await ctx.send("📝 No custom hallucination filters set.")
-            return
-        
-        phrases_list = "\n".join([f"• \"{phrase}\"" for phrase in sorted(sink.custom_hallucination_phrases)])
-        embed = discord.Embed(
-            title="📝 Custom Hallucination Filters",
-            description="Phrases you've blocked from transcriptions",
-            color=0x0099ff
-        )
-        embed.add_field(name="Blocked Phrases", value=phrases_list, inline=False)
-        await ctx.send(embed=embed)
-        
-    elif action.lower() == "clear":
-        sink.custom_hallucination_phrases.clear()
-        await ctx.send("✅ Cleared all custom hallucination filters.")
-        
-    else:
-        await ctx.send(f"❌ Unknown action '{action}'. Use: `add`, `remove`, `list`, or `clear`")
-
-@bot.command(name='transcription_quality', aliases=['quality', 'confidence', 'metrics'])
-async def transcription_quality(ctx):
-    """Show transcription quality metrics and confidence scores."""
-    guild_id = ctx.guild.id
-    
-    if guild_id not in active_meetings:
-        await ctx.send("❌ No active meeting found in this server.")
-        return
-    
-    meeting = active_meetings[guild_id]
-    sink = meeting.get("sink")
-    
-    if not sink:
-        await ctx.send("❌ Transcription sink not available.")
-        return
-    
-    # Calculate quality metrics
-    total_transcriptions = len(meeting["log"])
-    if total_transcriptions == 0:
-        await ctx.send("📊 No transcriptions recorded yet.")
-        return
-    
-    # Count filtered transcriptions (if tracking is enabled)
-    filtered_count = getattr(sink, 'filtered_transcriptions_count', 0)
-    
-    embed = discord.Embed(
-        title="📊 Transcription Quality Metrics",
-        description="Current meeting transcription statistics",
-        color=0x0099ff
-    )
-    
-    embed.add_field(
-        name="Total Transcriptions", 
-        value=f"💬 {total_transcriptions}", 
-        inline=True
-    )
-    
-    embed.add_field(
-        name="Filtered Out", 
-        value=f"🚫 {filtered_count} (hallucinations/noise)", 
-        inline=True
-    )
-    
-    embed.add_field(
-        name="Success Rate", 
-        value=f"📈 {((total_transcriptions - filtered_count) / total_transcriptions * 100):.1f}%", 
-        inline=True
-    )
-    
-    # Current filter settings
-    embed.add_field(
-        name="VAD Threshold", 
-        value=f"🎤 0.5 (aggressive)", 
-        inline=True
-    )
-    
-    embed.add_field(
-        name="Confidence Threshold", 
-        value=f"🛡️ -0.8 (high quality)", 
-        inline=True
-    )
-    
-    embed.add_field(
-        name="No Speech Threshold", 
-        value=f"🔇 0.8 (strict)", 
-        inline=True
-    )
-    
-    embed.add_field(
-        name="💡 Quality Tips", 
-        value="• Speak clearly and avoid background noise\n• Use `!hallucination_filter add \"phrase\"` to block false transcriptions\n• Lower latency modes may reduce quality slightly", 
-        inline=False
-    )
-    
-    await ctx.send(embed=embed)
-
 # ==== Error Handling ====
 @bot.event
 async def on_command_error(ctx, error):
@@ -1728,16 +1417,6 @@ async def meeting_help(ctx):
     embed.add_field(
         name="!streaming_mode", 
         value="Enable or disable streaming transcriptions for ultra-low perceived latency", 
-        inline=False
-    )
-    embed.add_field(
-        name="!hallucination_filter", 
-        value="Manage hallucination filters to prevent false transcriptions", 
-        inline=False
-    )
-    embed.add_field(
-        name="!transcription_quality", 
-        value="Show transcription quality metrics and confidence scores", 
         inline=False
     )
     embed.add_field(
@@ -1815,7 +1494,7 @@ if __name__ == "__main__":
     
     print("🚀 Bot starting...")
     try:
-        bot.run(discord_token)
+    bot.run(discord_token)
     except Exception as e:
         print(f"❌ Error starting bot: {e}")
         exit(1)
