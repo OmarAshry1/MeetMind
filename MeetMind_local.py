@@ -17,39 +17,6 @@ import logging
 import openai
 from openai import AsyncOpenAI
 import json
-from flask import Flask, jsonify
-import threading
-
-# Initialize Flask app for healthcheck
-app = Flask(__name__)
-
-@app.route('/')
-def healthcheck():
-    """Healthcheck endpoint for Railway."""
-    return jsonify({
-        "status": "healthy",
-        "bot": "MeetMind Discord Bot",
-        "timestamp": datetime.datetime.now().isoformat()
-    })
-
-@app.route('/health')
-def health():
-    """Detailed health endpoint."""
-    return jsonify({
-        "status": "healthy",
-        "bot": "MeetMind Discord Bot",
-        "features": [
-            "Live transcription",
-            "Multi-language support", 
-            "Document generation",
-            "AI Q&A about meetings"
-        ],
-        "timestamp": datetime.datetime.now().isoformat()
-    })
-
-def run_flask():
-    """Run Flask server in a separate thread."""
-    app.run(host='0.0.0.0', port=8000, debug=False)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -853,16 +820,6 @@ if __name__ == "__main__":
         print("   ✅ AI Q&A about meetings")
     else:
         print("   ❌ AI Q&A (missing OpenAI API key)")
-    
-    print("🌐 Starting Flask healthcheck server...")
-    # Start Flask server in a separate thread (non-daemon so it stays alive)
-    flask_thread = threading.Thread(target=run_flask, daemon=False)
-    flask_thread.start()
-    
-    # Give Flask server a moment to start up
-    import time
-    time.sleep(2)
-    print("✅ Flask server started on port 8000")
     
     print("🚀 Bot starting...")
     try:

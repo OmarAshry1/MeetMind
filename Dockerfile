@@ -27,8 +27,5 @@ COPY . .
 RUN useradd -m -u 1000 botuser && chown -R botuser:botuser /app
 USER botuser
 
-# Expose port for Flask healthcheck server
-EXPOSE 8000
-
 # Run the bot
 CMD ["python", "MeetMind_local.py"] 
