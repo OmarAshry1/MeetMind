@@ -2,6 +2,8 @@
 
 A powerful Discord bot that provides real-time voice transcription, multi-language support, and AI-powered Q&A for your meeting channels. Perfect for keeping accurate records of voice conversations and making meeting content searchable and accessible.
 
+## Link
+[Click Here](https://meetmind.xyz/)
 ## ✨ Features
 
 ### 🔊 Real-Time Transcription
