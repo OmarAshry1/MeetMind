@@ -176,6 +176,7 @@ class TranscriptionSink(voice_recv.AudioSink):
         self.pending_transcriptions = []  # Queue for pending transcriptions
         self.processing_lock = asyncio.Lock()  # Lock for sequential processing
         self.next_sequence = 0  # Sequence number for ordering
+        self.stopped = False  # Stop flag to block late transcriptions
         
         # Audio processing configuration - Optimized for low latency
         self.buffer_duration = 2.0  # Reduced from 5.0s for faster response
@@ -223,6 +224,8 @@ class TranscriptionSink(voice_recv.AudioSink):
     
     async def process_user_audio(self, uid, current_time):
         """Process audio for a specific user."""
+        if self.stopped or self.meeting.get("ended"):
+            return
         if self.processing[uid] or len(self.buffers[uid]) < self.min_buffer_size:
             return
         
@@ -260,6 +263,8 @@ class TranscriptionSink(voice_recv.AudioSink):
         return False
     
     def cleanup(self):
+        # Mark stopped to prevent any further processing/sending
+        self.stopped = True
         self.buffers.clear()
         self.last_time.clear()
         self.processing.clear()
@@ -267,6 +272,8 @@ class TranscriptionSink(voice_recv.AudioSink):
     
     def write(self, user, data: voice_recv.VoiceData):
         """Called by voice_recv when audio arrives (must be sync)."""
+        if self.stopped or self.meeting.get("ended"):
+            return
         if not data.pcm or not user:
             return
             
@@ -308,6 +315,8 @@ class TranscriptionSink(voice_recv.AudioSink):
     
     async def process_audio_async(self, transcription_task):
         """Process audio data asynchronously with proper ordering."""
+        if self.stopped or self.meeting.get("ended"):
+            return
         user = transcription_task['user']
         pcm_data = transcription_task['pcm_data']
         uid = transcription_task['uid']
@@ -327,9 +336,22 @@ class TranscriptionSink(voice_recv.AudioSink):
             
             # Transcribe audio
             loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(None, self.transcribe_audio, wav_buffer)
+            text, detected_lang, lang_prob = await loop.run_in_executor(None, self.transcribe_audio, wav_buffer)
             
-            if text and text.strip():
+            # If meeting language is fixed and differs from detected language (with confidence), record info-only entry
+            if self.language != "auto" and detected_lang and detected_lang != self.language and (lang_prob is None or lang_prob >= 0.80):
+                if not self.stopped and not self.meeting.get("ended"):
+                    async with self.processing_lock:
+                        self.pending_transcriptions.append({
+                            'timestamp': timestamp,
+                            'sequence': sequence,
+                            'speaker': user.display_name,
+                            'text': f"{user.display_name} spoke a different language",
+                            'user_id': uid
+                        })
+                        self.pending_transcriptions.sort(key=lambda x: (x['timestamp'], x['sequence']))
+                        await self.process_pending_transcriptions()
+            elif text and text.strip() and not self.stopped and not self.meeting.get("ended"):
                 # Add to pending transcriptions queue
                 async with self.processing_lock:
                     self.pending_transcriptions.append({
@@ -351,46 +373,9 @@ class TranscriptionSink(voice_recv.AudioSink):
         finally:
             self.processing[uid] = False
     
-    async def process_pending_transcriptions(self):
-        """Process all pending transcriptions in chronological order."""
-        while self.pending_transcriptions:
-            # Get the next transcription in order
-            transcription = self.pending_transcriptions.pop(0)
-            
-            # Format timestamp
-            timestamp = transcription['timestamp'].strftime("%H:%M:%S")
-            speaker = transcription['speaker']
-            text = transcription['text']
-            
-            # Add to meeting log
-            entry = {
-                'timestamp': timestamp,
-                'speaker': speaker,
-                'text': text,
-                'user_id': transcription['user_id']
-            }
-            self.meeting["log"].append(entry)
-            
-            # Save meetings after adding new transcription data
-            save_meetings()
-            
-            # Send to channel
-            channel = self.meeting["channel"]
-            if channel:
-                try:
-                    await channel.send(f"[{timestamp}] **{speaker}**: {text}")
-                except discord.errors.NotFound:
-                    logger.warning("Text channel not found, meeting may have ended")
-                except Exception as e:
-                    logger.error(f"Error sending message to channel: {e}")
-            
-            # Small delay to ensure proper ordering in Discord
-            await asyncio.sleep(0.1)
-    
     def transcribe_audio(self, wav_buffer):
-        """Transcribe audio using Whisper model with language support."""
+        """Transcribe audio using Whisper model with language support and return (text, detected_lang, prob)."""
         try:
-            
             language_code = None if self.language == "auto" else self.language
             
             segments, info = model.transcribe(
@@ -398,25 +383,27 @@ class TranscriptionSink(voice_recv.AudioSink):
                 language=language_code,
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
-                word_timestamps=True,
-                condition_on_previous_text=True,
+                word_timestamps=False,
+                condition_on_previous_text=False,
                 compression_ratio_threshold=2.4,
                 log_prob_threshold=-1.0,
                 no_speech_threshold=0.6,
                 temperature=0.0,
-                beam_size=5
+                beam_size=1
             )
             
             text_segments = []
             for segment in segments:
-                
-                if segment.text.strip() and len(segment.text.strip()) > 1:
-                    text_segments.append(segment.text.strip())
-            
-            return " ".join(text_segments)
+                s = getattr(segment, 'text', '')
+                if s and s.strip():
+                    text_segments.append(s.strip())
+            joined = " ".join(text_segments)
+            detected_lang = getattr(info, 'language', None)
+            lang_prob = getattr(info, 'language_probability', None)
+            return joined, detected_lang, lang_prob
         except Exception as e:
             logger.error(f"Transcription error: {e}")
-            return ""
+            return "", None, None
 
 
 async def get_meeting_context_from_channel(channel):
@@ -790,6 +777,8 @@ async def end_meeting(ctx, format_type="pdf"):
         return
     
     meeting = active_meetings.pop(guild_id)
+    # Mark meeting ended so sinks and pending tasks stop
+    meeting["ended"] = True
     save_meetings() # Save meeting before it's removed
     
     try:
@@ -799,7 +788,10 @@ async def end_meeting(ctx, format_type="pdf"):
         
         # Disconnect from voice
         if meeting["vc"]:
-            await meeting["vc"].disconnect()
+            try:
+                await meeting["vc"].disconnect()
+            except Exception:
+                pass
         
         # Generate transcript document
         if meeting["log"]:
@@ -810,11 +802,7 @@ async def end_meeting(ctx, format_type="pdf"):
             filename = await create_transcript_document(meeting["log"], format_type.lower())
             
             # Send transcript to the channel - use fallback if meeting channel is not available
-            channel = meeting["channel"]
-            if not channel:
-                # If meeting channel is not available (e.g., after bot restart), use the command channel
-                channel = ctx.channel
-                logger.info(f"Meeting channel not available, using command channel {ctx.channel.name} for transcript")
+            channel = meeting["channel"] or ctx.channel
             
             duration = datetime.datetime.now() - meeting["start_time"]
             
